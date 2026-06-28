@@ -503,21 +503,7 @@ plot_lineage <- function(
 
 ## Background and Objectives
 
-<!-- Tailor this section to each specific collaborator and pilot -->
-
-Dr. Brooke Fridley is investigating Ewing sarcoma (EWS), a rare cancer that affects bones and soft tissue in children, teens and young adults. We report an exploratory analysis of the relative abundance of T, B, NK, and myeloid phenotypes.
-
 ## Methods
-
-<!-- This section should be consistent across pilots (unless changing methods) -->
-
-Multiplex immunofluorescence images were generated from `r length(unique(spatial_df_final$SampleID))` tissue samples across `r length(unique(spatial_df_final$SubjectID))` patients. Nine samples are derived from primary tumors, while four are from metastatic tumors.
-
-Tissues of interest were adhered to microscope slides with standard histological techniques. The slides were prepared and stained according to the method published in Akoya Biosciences PhenoCycler-Fusion user manual \[1\]. This method involves antigen retrieval, then staining using a panel of Akoya Biosciences manufactured antibodies, before final tissue fixation. Subsequent slide processing occurred on the PhenoCycler-Fusion system where a set of reporters were dispensed onto the tissue so that distinct images could be acquired and compiled using fluorescence microscopy.
-
-Multiplex images were segmented in QuPath using a pre-trained StarDist deep‑learning model to identify individual cells within manually annotated regions corresponding to each sample \[2,3\]. For each marker, expression values were log-transformed and scaled by the per-slide mean intensity to reduce slide-to-slide variation and minimize batch effects.
-
-Cell phenotyping was performed using *GammaGateR*, a computationally efficient Gamma mixture model with the ability to specify priors on the expected modes of the marker-negative and marker-positive distributions \[4\]. For each cell, the model computes the posterior probability of being marker-positive given the measured expression. These probabilities are then used to perform binary phenotype assignment using a Bayesian false discovery rate gating rule. We select the most stringent probability cutoff that controlled expected false positives while keeping the overall positivity rate within prespecified, marker-specific bounds based on known biology and staining characteristics. Multi‑marker phenotypes are then assigned by logical combination of the per‑marker binary calls according to the predefined lineage/subtype rules in the table below.
 
 ```{r gating summary}
 
@@ -546,15 +532,9 @@ spatial_df_final %>%
 
 ```
 
-Any marker combinations not mapped to prespecified phenotypes of primary interest are consolidated into an “Other/Unassigned” category.
-
-Details on the parameters used for segmentation and phenotyping, as well as analysis session info, can be located in the Appendix section.
-
 ## Results
 
 ### Abundance
-
-Figure 1 summarizes phenotype abundances as a percent of total cells in each sample.
 
 ```{r Table1}
 
@@ -861,8 +841,6 @@ cat(":::\n")  # close the tabset
 ```
 
 **Figure 1:** Boxplots of percent abundance for each immune cell phenotype out of all cells in the sample. Colored dots indicate primary (blue) or metastatic (red) tumors.
-
-The majority of immune phenotypes across the tissue samples were myeloid cells, followed by NK cells and minimal T or B phenotypes. Among the myeloid cells, the most frequent phenotypes were general macrophages (CD68+), neutrophils (CD66+MPO+), and M-MDSCs (CD11b+CD14+HLA-DR^low^). T cell phenotypes were limited to general T cells (CD3e+), though this may be due to known issues with this marker across pilots.
 
 ```{r phenotypeproptable}
 #| fig-width: 11       # bigger intrinsic figure size (inches)
@@ -1364,14 +1342,6 @@ plot_spatial_tabs_html(
 ```
 
 ## Conclusions
-
-Based on the data, we can make the following preliminary conclusions:
-
-1.  No visible differences between primary and metastatic tumors.
-
-2.  Myeloids were the most abundant lineage, with general macrophages (CD68+), neutrophils (CD66+MPO+), and M-MDSCs (CD11b+CD14+HLA-DR^low^) as the most common myeloid phenotypes.
-
-3.  Several samples had \~3-5% NK cell composition, with even lower T cell and B cell abundance across all samples.
 
 ### Algorithm Parameters
 
