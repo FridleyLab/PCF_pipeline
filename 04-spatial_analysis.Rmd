@@ -1,0 +1,1600 @@
+---
+title: "Multiplex Imaging — Binarization, Phenotyping, and QC"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+    self_contained: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+
+.libPaths("/mnt/project/blfridley/PCF_pilots/_common/R/renv/library/linux-rhel-8.10/R-4.4/x86_64-pc-linux-gnu")
+
+suppressPackageStartupMessages({
+  library(yaml)
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(gtsummary)
+  library(purrr)
+  library(tibble)
+  library(scales)
+  library(skimr)
+  library(forcats)
+  library(rlang)
+  library(tools)
+  library(kableExtra)
+  library(ggrepel)
+  library(patchwork)
+  library(rstatix)
+  library(stringr)
+  library(parallel)
+})
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = NA
+)
+
+cfg_path <- normalizePath("../config.yml", mustWork = TRUE)
+cfg      <- read_yaml(cfg_path)
+
+FLAG_RED    <- "#d62728"
+FLAG_ORANGE <- "#ff7f0e"
+NEUTRAL     <- "#aec7e8"
+
+sample_col    <- "SampleID"
+lineage_col   <- "Lineage"
+phenotype_col <- "Phenotype"
+```
+
+# Overview
+
+This document performs three sequential steps following GammaGateR model
+fitting:
+
+1. **Marker binarization** — converts continuous per-cell posterior
+   probabilities into binary 0/1 calls using a Bayesian FDR thresholding
+   approach, with per-marker parameter control.
+2. **Phenotype assignment** — applies a hierarchical rule set to the binary
+   marker calls to assign each cell a lineage and phenotype label.
+3. **QC and abundance summarization** — audits the gating results, flags
+   anomalies, and constructs the per-sample abundance data frame for
+   downstream analysis.
+
+**Before running this document** you should have reviewed the GammaGateR
+diagnostics report (`03-GGR_Diagnostics.Rmd`) and confirmed that the model
+fit is adequate for each marker × sample combination.
+
+**Sections requiring manual specification:**
+
+- **Section 1b** — per-marker FDR targets, minimum positive rates, and
+  maximum positive rate caps.
+- **Section 2b** — phenotype rule hierarchy and phenotype level ordering.
+
+Everything else runs automatically once those inputs are set.
+
+---
+
+# 1. Marker Binarization
+
+## 1a. Load posterior probabilities
+
+Each row in `df_base` is one cell. Columns are per-marker posterior
+probabilities P(marker-positive | observed intensity) from GammaGateR,
+plus cell-level metadata (ImageID, SampleID, SubjectID, X, Y).
+
+```{r load-data}
+model_version <- "fit13"
+
+df_base <- {
+  fit_dir <- normalizePath(
+    file.path("..", "results", "GammaGateR", model_version),
+    mustWork = TRUE
+  )
+
+  left_cols <- c("ImageID", "SubjectID", "X", "Y")
+
+  data_processed <- fread(
+    file.path("..", cfg$paths$folders$results, "data_processed.csv")
+  ) %>% as_tibble()
+
+  rds_files <- list.files(fit_dir, pattern = "\\.rds$", full.names = TRUE)
+  rds_files <- rds_files[!grepl("boundar", basename(rds_files),
+                                ignore.case = TRUE)]
+
+  if (!length(rds_files))
+    stop("No GammaGateR RDS files found in: ", fit_dir)
+
+  exprZ_all <- map_dfr(rds_files, function(f) {
+    fit <- readRDS(f)
+    if (is.list(fit) && length(fit) == 1L) fit <- fit[[1L]]
+    if (is.null(fit$expressionZ))
+      stop("Missing `expressionZ` in: ", basename(f))
+    as.data.frame(fit$expressionZ) %>%
+      as_tibble() %>%
+      mutate(SampleID  = file_path_sans_ext(basename(f)),
+             CellIndex = row_number())
+  })
+
+  metadata_by_cell <- data_processed %>%
+    mutate(
+      SampleID_join = as.character(SampleID),
+      CellIndex     = ave(seq_len(n()), SampleID_join, FUN = seq_along)
+    ) %>%
+    select(SampleID_join, CellIndex, any_of(left_cols))
+
+  out <- exprZ_all %>%
+    left_join(metadata_by_cell,
+              by = c("SampleID" = "SampleID_join",
+                     "CellIndex" = "CellIndex"))
+
+  n_missing <- sum(is.na(out$ImageID) | is.na(out$SubjectID))
+  if (n_missing > 0)
+    stop("Metadata join failed for ", n_missing, " rows. ",
+         "RDS cell order does not align with data_processed within SampleID.")
+
+  out %>%
+    select(-CellIndex) %>%
+    rename_with(~ gsub("^nzNorm_", "", .x), starts_with("nzNorm_")) %>%
+    relocate(any_of(c("ImageID", "SampleID", "SubjectID", "X", "Y")),
+             .before = 1)
+}
+
+cat("df_base:", format(nrow(df_base), big.mark = ","), "cells x",
+    ncol(df_base), "columns\n")
+cat("Samples:", paste(sort(unique(df_base$SampleID)), collapse = ", "), "\n")
+```
+
+## 1b. Gating parameters
+
+**Specify per-marker values here.** These three parameters jointly control
+the Bayesian FDR thresholding behavior for each marker:
+
+| Parameter | Role |
+|---|---|
+| `marker_fdr` | Maximum tolerated Bayesian FDR among positive calls. Lower = more stringent. Typical range 0.05–0.20. |
+| `marker_min_pos` | Floor on positive call rate. Prevents rare but real populations from being thresholded to zero. |
+| `marker_max_cap` | Ceiling on positive call rate. Prevents non-specific absorption of bulk negative cells. |
+
+Consult the GammaGateR diagnostics report (λ estimates, posterior
+distributions, and confidence indices) to inform these values before running.
+
+```{r gating-params}
+# ── USER-SPECIFIED ────────────────────────────────────────────────────────────
+
+marker_fdr <- c(
+  CD3e     = 0.10, CD4   = 0.20, CD8   = 0.20, FOXP3 = 0.20, CD39  = 0.20,
+  CD56     = 0.05, CD20  = 0.15,
+  CD66     = 0.10, MPO   = 0.10,
+  CD68     = 0.05, CD163 = 0.10, CD206 = 0.10, iNOS  = 0.10,
+  CD11b    = 0.10, CD14  = 0.10, CD11c = 0.10,
+  `HLA-DR` = 0.10
+)
+
+marker_min_pos <- setNames(rep(0.001, length(marker_fdr)), names(marker_fdr))
+
+marker_max_cap <- c(
+  CD3e     = 0.05, CD4   = 0.05, CD8   = 0.05, FOXP3 = 0.05, CD39  = 0.05,
+  CD56     = 0.05, CD20  = 0.08,
+  CD66     = 0.15, MPO   = 0.15,
+  CD68     = 0.20, CD163 = 0.25, CD206 = 0.25, iNOS  = 0.20,
+  CD11b    = 0.40, CD14  = 0.30, CD11c = 0.20,
+  `HLA-DR` = 0.50
+)
+
+```
+
+```{r gating-params-table, echo=FALSE}
+tibble(
+  Marker         = names(marker_fdr),
+  `FDR target`   = marker_fdr,
+  `Min pos rate` = marker_min_pos,
+  `Max pos cap`  = marker_max_cap
+) %>%
+  kbl(caption = "Gating parameters as currently specified") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  scroll_box(width = "100%")
+```
+
+## 1c. Binarization function
+
+`make_marker_binary()` converts posterior probabilities to binary 0/1 calls.
+This pipeline uses `fdr_bayesian` exclusively. The Bayesian FDR at threshold
+_t_ is:
+
+> BFDR(t) = Σ\_{i: p_i ≥ t} (1 − p_i) / |{i: p_i ≥ t}|
+
+The largest _t_ satisfying BFDR(t) ≤ `fdr` and positive call rate within
+`[min_pos_rate, max_pos_rate_cap]` is selected per marker × sample. If no
+such _t_ exists, the function falls back to the `1 − min_pos_rate` quantile
+and records the event for QC inspection.
+
+```{r make-marker-binary-fn, include=FALSE}
+make_marker_binary <- function(df,
+                               markers,
+                               threshold           = 0.5,
+                               group_col           = "SampleID",
+                               method              = c("fixed", "quantile",
+                                                       "fdr", "fdr_bayesian"),
+                               max_pos_rate        = NULL,
+                               fdr                 = 0.01,
+                               neg_frac            = 0.90,
+                               min_pos_rate        = 5e-4,
+                               max_pos_rate_cap    = 0.50,
+                               return_diagnostics  = FALSE,
+                               diagnostics_markers = NULL,
+                               diagnostics_groups  = NULL,
+                               n_grid              = 500L,
+                               n_workers           = min(parallel::detectCores() - 1L, 8L),
+                               eps                 = 1e-6) {
+
+  method      <- match.arg(method)
+  hit_markers <- markers[markers %in% names(df)]
+  if (!length(hit_markers)) stop("No marker columns found.")
+  if (!group_col %in% names(df)) stop("group_col not found in df.")
+
+  .get_marker_val <- function(x, m, default = NULL) {
+    if (is.null(x)) return(default)
+    if (length(x) == 1L && is.null(names(x))) return(as.numeric(x))
+    if (!is.null(names(x)) && m %in% names(x)) return(as.numeric(x[[m]]))
+    default
+  }
+
+  gsym <- sym(group_col)
+
+  .clamp_thr <- function(thr, v) {
+    if (!is.finite(thr)) return(thr)
+    vmax <- max(v, na.rm = TRUE)
+    if (is.finite(vmax)) thr <- min(thr, vmax - eps)
+    min(thr, 1 - eps)
+  }
+
+  .enforce_mpr <- function(thr0, v, mpr) {
+    if (!is.finite(thr0)) return(thr0)
+    mpr     <- max(min(as.numeric(mpr), 0.99), 1e-12)
+    thr_mpr <- as.numeric(quantile(v, probs = 1 - mpr,
+                                   na.rm = TRUE, names = FALSE, type = 1))
+    min(thr0, thr_mpr)
+  }
+
+  # ── Fixed threshold ──────────────────────────────────────────────────────────
+  if (method == "fixed") {
+    thr <- if (length(threshold) == 1L) {
+      setNames(rep(threshold, length(hit_markers)), hit_markers)
+    } else if (!is.null(names(threshold))) {
+      out <- setNames(rep(0.5, length(hit_markers)), hit_markers)
+      out[intersect(names(threshold), hit_markers)] <-
+        threshold[intersect(names(threshold), hit_markers)]
+      out
+    } else {
+      if (length(threshold) != length(hit_markers))
+        stop("Unnamed `threshold` must match length of found markers.")
+      setNames(threshold, hit_markers)
+    }
+
+    out_df <- df %>%
+      select(any_of(c("ImageID", "SampleID", "SubjectID", "X", "Y")),
+             all_of(hit_markers)) %>%
+      mutate(across(all_of(hit_markers),
+                    ~ as.integer(.x >= thr[cur_column()])))
+
+    if (!return_diagnostics) return(out_df)
+    return(list(
+      out         = out_df,
+      diagnostics = list(method = method, group_col = group_col,
+                         hit_markers = hit_markers,
+                         thr_tbl = tibble(), thr_long = tibble())
+    ))
+  }
+
+  # ── Quantile threshold ───────────────────────────────────────────────────────
+  f_quant_thr <- function(v, r, mpr, cap) {
+    v <- v[is.finite(v)]
+    if (!length(v)) return(NA_real_)
+    r    <- max(min(as.numeric(r), as.numeric(cap)), as.numeric(mpr))
+    thr0 <- as.numeric(quantile(v, probs = 1 - r,
+                                na.rm = TRUE, names = FALSE, type = 7))
+    .clamp_thr(thr0, v)
+  }
+
+  # ── Frequentist FDR threshold ────────────────────────────────────────────────
+  f_fdr_thr <- function(v, alpha, nf, mpr, cap) {
+    alpha <- max(min(as.numeric(alpha), 0.5),  1e-6)
+    nf    <- max(min(as.numeric(nf),    0.99), 0.50)
+    mpr   <- max(min(as.numeric(mpr),   0.99), 1e-6)
+    cap   <- max(min(as.numeric(cap),   0.99), mpr)
+    v     <- v[is.finite(v)]
+    if (!length(v)) return(NA_real_)
+
+    sv <- sort(v); n <- length(sv)
+    ts <- rle(sv)$values
+    if (length(ts) > n_grid)
+      ts <- sort(unique(as.numeric(quantile(
+        ts, probs = seq(0.001, 0.999, length.out = n_grid),
+        na.rm = TRUE, names = FALSE, type = 7
+      ))))
+    tmax <- max(ts, na.rm = TRUE); ts <- ts[ts < tmax]
+
+    qneg   <- as.numeric(quantile(v, probs = nf,
+                                  na.rm = TRUE, names = FALSE, type = 7))
+    sv_neg <- sv[sv <= qneg]
+
+    if (!length(ts) || !length(sv_neg)) {
+      thr0 <- as.numeric(quantile(v, probs = 1 - mpr,
+                                  na.rm = TRUE, names = FALSE, type = 7))
+      return(.clamp_thr(.enforce_mpr(thr0, v, mpr), v))
+    }
+
+    rr    <- rle(sv);  u <- rr$values; cnt <- rr$lengths; cum <- cumsum(cnt)
+    rrn   <- rle(sv_neg); u_n <- rrn$values; cnt_n <- rrn$lengths
+    cum_n <- cumsum(cnt_n); n_neg <- length(sv_neg)
+
+    le_idx   <- findInterval(ts, u)
+    le_cnt   <- ifelse(le_idx > 0L, cum[le_idx], 0L)
+    mtch     <- match(ts, u, nomatch = 0L)
+    eq_cnt   <- ifelse(mtch > 0L, cnt[mtch], 0L)
+    ge_cnt   <- n - (le_cnt - eq_cnt); den <- ge_cnt / n
+
+    le_idx_n <- findInterval(ts, u_n)
+    le_cnt_n <- ifelse(le_idx_n > 0L, cum_n[le_idx_n], 0L)
+    mtch_n   <- match(ts, u_n, nomatch = 0L)
+    eq_cnt_n <- ifelse(mtch_n > 0L, cnt_n[mtch_n], 0L)
+    ge_cnt_n <- n_neg - (le_cnt_n - eq_cnt_n); num <- ge_cnt_n / n_neg
+
+    fdr_hat <- ifelse(den > 0, num / den, 1)
+    ok      <- which(fdr_hat <= alpha & den >= mpr & den <= cap)
+    thr0    <- if (!length(ok))
+      as.numeric(quantile(v, probs = 1 - mpr,
+                          na.rm = TRUE, names = FALSE, type = 7))
+    else ts[max(ok)]
+    .clamp_thr(.enforce_mpr(thr0, v, mpr), v)
+  }
+
+  # ── Bayesian FDR threshold ───────────────────────────────────────────────────
+  # BFDR(t) = sum_{i: p_i >= t}(1 - p_i) / |{i: p_i >= t}|
+  # Optimised: findInterval replaces vapply loop (O(n log n) vs O(n * |ts|)).
+  # Threshold grid capped at n_grid points; cum_false precomputed once.
+  f_bfdr_thr <- function(v, alpha, mpr, cap) {
+    alpha <- max(min(as.numeric(alpha), 0.5),  1e-6)
+    mpr   <- max(min(as.numeric(mpr),   0.99), 1e-6)
+    cap   <- max(min(as.numeric(cap),   0.99), mpr)
+    v     <- sort(v[is.finite(v)])
+    n     <- length(v)
+    if (!n) return(NA_real_)
+
+    ts <- unique(v)
+    if (length(ts) > n_grid)
+      ts <- unique(as.numeric(quantile(
+        ts, probs = seq(0.001, 0.999, length.out = n_grid),
+        na.rm = TRUE, names = FALSE, type = 7
+      )))
+    ts <- sort(ts[ts < max(ts)])
+
+    if (!length(ts)) {
+      thr0 <- as.numeric(quantile(v, probs = 1 - mpr,
+                                  na.rm = TRUE, names = FALSE, type = 7))
+      return(.clamp_thr(.enforce_mpr(thr0, v, mpr), v))
+    }
+
+    # k_of_t[i] = number of cells with value >= ts[i]
+    # v is sorted ascending; findInterval gives last index < ts[i]
+    k_of_t    <- n - findInterval(ts, v, left.open = TRUE)
+    den_t     <- k_of_t / n
+
+    # Precompute cumulative sum of (1 - p) over descending-sorted values
+    # cum_false[k] = expected false positives among top-k cells
+    cum_false <- cumsum(1 - rev(v))
+    bfdr_t    <- ifelse(k_of_t > 0L, cum_false[k_of_t] / k_of_t, 1)
+
+    ok   <- which(bfdr_t <= alpha & den_t >= mpr & den_t <= cap)
+    thr0 <- if (!length(ok))
+      as.numeric(quantile(v, probs = 1 - mpr,
+                          na.rm = TRUE, names = FALSE, type = 7))
+    else ts[max(ok)]
+    .clamp_thr(.enforce_mpr(thr0, v, mpr), v)
+  }
+
+  # ── Compute thresholds ───────────────────────────────────────────────────────
+  # Thresholds computed directly from wide df without pivot_longer,
+  # avoiding materialising an n_cells * n_markers long-format frame.
+  # Groups run in parallel via furrr when n_workers > 1.
+
+  sample_ids <- unique(df[[group_col]])
+
+  compute_group_thr <- function(m, s) {
+    v     <- df[[m]][df[[group_col]] == s]
+    v     <- v[is.finite(v)]
+    alpha <- as.numeric(.get_marker_val(fdr,             m, fdr))
+    nf    <- as.numeric(.get_marker_val(neg_frac,         m, neg_frac))
+    mpr   <- as.numeric(.get_marker_val(min_pos_rate,     m, min_pos_rate))
+    cap   <- as.numeric(.get_marker_val(max_pos_rate_cap, m, max_pos_rate_cap))
+
+    thr_val <- switch(method,
+      quantile = {
+        r <- as.numeric(.get_marker_val(max_pos_rate, m, max_pos_rate))
+        f_quant_thr(v, r = r, mpr = mpr, cap = cap)
+      },
+      fdr          = f_fdr_thr(v,  alpha = alpha, nf = nf, mpr = mpr, cap = cap),
+      fdr_bayesian = f_bfdr_thr(v, alpha = alpha, mpr = mpr, cap = cap)
+    )
+
+    tibble(
+      !!group_col := s,
+      marker      = m,
+      n           = length(v),
+      alpha       = alpha,
+      nf          = if (method == "fdr") nf else NA_real_,
+      mpr         = mpr,
+      cap         = cap,
+      thr         = thr_val,
+      q_neg       = if (method == "fdr")
+        as.numeric(quantile(v, probs = nf, na.rm = TRUE,
+                            names = FALSE, type = 7))
+      else NA_real_
+    )
+  }
+
+  groups <- expand.grid(marker = hit_markers, sample = sample_ids,
+                        stringsAsFactors = FALSE)
+
+  if (n_workers > 1L && requireNamespace("parallel", quietly = TRUE)) {
+    cl <- parallel::makeCluster(n_workers)
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+    parallel::clusterExport(
+      cl,
+      varlist = c("df", "group_col", "hit_markers", "method",
+                  "fdr", "neg_frac", "min_pos_rate", "max_pos_rate_cap",
+                  "max_pos_rate", "n_grid", "eps",
+                  "f_quant_thr", "f_fdr_thr", "f_bfdr_thr",
+                  ".get_marker_val", ".clamp_thr", ".enforce_mpr",
+                  "compute_group_thr"),
+      envir = environment()
+    )
+    parallel::clusterEvalQ(cl, library(dplyr))
+    thr_long <- do.call(
+      bind_rows,
+      parallel::clusterMap(
+        cl,
+        compute_group_thr,
+        m = groups$marker,
+        s = groups$sample
+      )
+    )
+  } else {
+    thr_long <- map2_dfr(groups$marker, groups$sample, compute_group_thr)
+  }
+
+  # ── Diagnostics: den_at_thr and fallback flag ────────────────────────────────
+  # Compute positive call rate at the selected threshold per group,
+  # and flag groups where the threshold equals the min_pos_rate quantile floor.
+  thr_long <- thr_long %>%
+    rowwise() %>%
+    mutate(
+      den_at_thr = {
+        v <- df[[marker]][df[[group_col]] == .data[[group_col]]]
+        v <- v[is.finite(v)]
+        if (is.finite(thr) && length(v)) mean(v >= thr) else NA_real_
+      },
+      q_1_minus_mpr = {
+        v <- df[[marker]][df[[group_col]] == .data[[group_col]]]
+        v <- v[is.finite(v)]
+        if (length(v))
+          as.numeric(quantile(v, probs = 1 - mpr,
+                              na.rm = TRUE, names = FALSE, type = 7))
+        else NA_real_
+      }
+    ) %>%
+    ungroup() %>%
+    mutate(
+      thr_equals_q_1_minus_mpr = if_else(
+        is.finite(thr) & is.finite(q_1_minus_mpr),
+        abs(thr - q_1_minus_mpr) < 1e-10,
+        NA
+      )
+    )
+
+  # ── Apply thresholds ─────────────────────────────────────────────────────────
+  # Vectorised per-marker application avoids dplyr pick() overhead.
+  thr_tbl <- thr_long %>%
+    select(all_of(group_col), marker, thr) %>%
+    pivot_wider(names_from = marker, values_from = thr, names_prefix = "thr__")
+
+  base <- df %>%
+    select(any_of(c("ImageID", "SampleID", "SubjectID", "X", "Y")),
+           all_of(group_col), all_of(hit_markers))
+
+  out <- base
+  thr_idx <- match(base[[group_col]], thr_tbl[[group_col]])
+
+  for (m in hit_markers) {
+    thr_vec <- thr_tbl[[paste0("thr__", m)]][thr_idx]
+    thr_vec[!is.finite(thr_vec)] <- Inf
+    out[[m]] <- as.integer(base[[m]] >= thr_vec)
+  }
+
+  out <- select(out,
+    any_of(union(c("ImageID", "SampleID", "SubjectID", "X", "Y"), group_col)),
+    all_of(hit_markers)
+  )
+
+  if (!return_diagnostics) return(out)
+
+  # ── Diagnostics object ───────────────────────────────────────────────────────
+  if (!is.null(diagnostics_markers))
+    thr_long <- filter(thr_long, marker %in% diagnostics_markers)
+  if (!is.null(diagnostics_groups))
+    thr_long <- filter(thr_long, .data[[group_col]] %in% diagnostics_groups)
+
+  list(
+    out         = out,
+    diagnostics = list(
+      method      = method,
+      group_col   = group_col,
+      hit_markers = hit_markers,
+      thr_tbl     = thr_tbl,
+      thr_long    = thr_long
+    )
+  )
+}
+
+```
+
+## 1d. Run binarization
+
+```{r binarize}
+binary_result <- make_marker_binary(
+  df               = df_base,
+  markers          = names(marker_fdr),
+  method           = "fdr_bayesian",
+  group_col        = "SampleID",
+  fdr              = marker_fdr,
+  min_pos_rate     = marker_min_pos,
+  max_pos_rate_cap = marker_max_cap,
+  return_diagnostics = TRUE
+)
+
+spatial_df_univariate <- binary_result$out
+
+cat("Binary calls generated for",
+    format(nrow(spatial_df_univariate), big.mark = ","),
+    "cells across",
+    n_distinct(spatial_df_univariate$SampleID), "samples.\n")
+```
+
+## 1e. Threshold summary
+
+The table below shows the per-marker per-sample thresholds that were applied
+and the resulting positive call rate. `Fallback = ⚠ Yes` means the Bayesian
+FDR constraint was unsatisfiable for that marker × sample and the algorithm
+defaulted to the `min_pos_rate` floor — revisit the corresponding `fdr` or
+`max_pos_rate_cap` setting if this occurs frequently for a given marker.
+
+```{r threshold-summary, echo=FALSE}
+binary_result$diagnostics$thr_long %>%
+  mutate(
+    thr        = round(thr, 4),
+    den_at_thr = round(den_at_thr, 4),
+    fallback   = if_else(thr_equals_q_1_minus_mpr == TRUE, "⚠ Yes", "—")
+  ) %>%
+  select(
+    Sample      = SampleID,
+    Marker      = marker,
+    Threshold   = thr,
+    `Pos rate`  = den_at_thr,
+    `Fallback?` = fallback
+  ) %>%
+  kbl(caption = paste0(
+    "Applied thresholds and positive call rates per marker × sample. ",
+    "⚠ = FDR constraint unsatisfiable; fell back to min_pos_rate floor."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  scroll_box(width = "100%", height = "500px")
+```
+
+---
+
+# 2. Phenotype Assignment
+
+## 2a. Lineage and phenotype rules
+
+**Specify the biological gating hierarchy here.** Two things to set:
+
+**`phenotype_levels`** — a named list defining which phenotypes belong to
+each lineage and their display order in plots. Lineage names must match
+exactly what the `Lineage` assignment produces below.
+
+**Phenotype `case_when` block** — ordered from most to least specific
+within each lineage. The first matching rule wins. Add new phenotypes
+above the lineage-level catch-all for that lineage (e.g. above
+`Lineage == "T" ~ "T cell (CD3e+)"`). Any marker referenced here must
+have been included in the binarization step above.
+
+```{r phenotype-levels}
+# ── USER-SPECIFIED ────────────────────────────────────────────────────────────
+# Define phenotype membership and display order per lineage.
+# Names must match Lineage values produced in the case_when block below.
+
+phenotype_levels <- list(
+  "T" = c(
+    "T cell (CD3e+)",
+    "Helper T (CD3e+CD4+CD8-)",
+    "Cytotoxic T (CD3e+CD8+)",
+    "Regulatory T (CD3e+CD4+FOXP3+CD39+)"
+  ),
+  "NK" = c(
+    "NK cell (CD3e-CD56+)"
+  ),
+  "B" = c(
+    "B cell (CD20+)"
+  ),
+  "Myeloid" = c(
+    "Dendritic cell (CD11c+HLA-DR+CD3e-CD20-CD68low)",
+    "Neutrophil (CD66+MPO+)",
+    "M-MDSC (CD11b+CD14+HLA-DRlow)",
+    "PMN-MDSC (CD11b+CD14-CD66+MPO+HLA-DRlow)",
+    "M1 macrophage (CD68+iNOS+CD163low)",
+    "M2 macrophage (CD68+CD163+CD206+)",
+    "Pan-macrophage (CD68+)"
+  )
+)
+
+```
+
+```{r phenotype-assignment}
+spatial_df_final <- spatial_df_univariate %>%
+  mutate(across(all_of(names(marker_fdr)), function(x) as.integer(coalesce(as.integer(x), 0L)))) %>%
+  rename(HLA_DR = `HLA-DR`) %>%
+  mutate(
+
+    # ── Step 1: Lineage ───────────────────────────────────────────────────────
+    is_T       = CD3e == 1,
+    is_B       = CD20 == 1,
+    is_NK      = CD3e == 0 & CD56 == 1,
+    is_Myeloid = CD11b == 1 | CD68 == 1 | CD66 == 1,
+    n_lin      = as.integer(is_T) + as.integer(is_B) +
+                 as.integer(is_NK) + as.integer(is_Myeloid),
+
+    Lineage = case_when(
+      n_lin >= 2 ~ "Ambiguous/Double+",
+      is_T       ~ "T",
+      is_B       ~ "B",
+      is_NK      ~ "NK",
+      is_Myeloid ~ "Myeloid",
+      TRUE       ~ "Other"
+    ),
+
+    # ── Step 2: Phenotype ─────────────────────────────────────────────────────
+    # Rules evaluated top-to-bottom; first match wins.
+    # More specific rules must precede less specific ones within each lineage.
+    Phenotype = case_when(
+
+      Lineage == "Ambiguous/Double+" ~ "Ambiguous/Double+",
+
+      # T cells
+      Lineage == "T" & CD4 == 1 & FOXP3 == 1 & CD39 == 1 ~
+        "Regulatory T (CD3e+CD4+FOXP3+CD39+)",
+      Lineage == "T" & CD8 == 1 ~
+        "Cytotoxic T (CD3e+CD8+)",
+      Lineage == "T" & CD4 == 1 & CD8 == 0 ~
+        "Helper T (CD3e+CD4+CD8-)",
+      Lineage == "T" ~
+        "T cell (CD3e+)",
+
+      # NK cells
+      Lineage == "NK" ~
+        "NK cell (CD3e-CD56+)",
+
+      # B cells
+      Lineage == "B" ~
+        "B cell (CD20+)",
+
+      # Dendritic cells
+      Lineage == "Myeloid" & CD11c == 1 & HLA_DR == 1 & CD3e == 0 & CD20 == 0 & CD68 == 0 ~
+        "Dendritic cell (CD11c+HLA-DR+CD3e-CD20-CD68low)",
+
+      # Neutrophils
+      Lineage == "Myeloid" & CD66 == 1 & MPO == 1 ~
+        "Neutrophil (CD66+MPO+)",
+
+      # MDSCs
+      Lineage == "Myeloid" & CD11b == 1 & CD14 == 1 & HLA_DR == 0 ~
+        "M-MDSC (CD11b+CD14+HLA-DRlow)",
+      Lineage == "Myeloid" & CD11b == 1 & CD14 == 0 & CD66 == 1 & MPO == 1 & HLA_DR == 0 ~
+        "PMN-MDSC (CD11b+CD14-CD66+MPO+HLA-DRlow)",
+
+      # Macrophages
+      Lineage == "Myeloid" & CD68 == 1 & iNOS == 1 & CD163 == 0 ~
+        "M1 macrophage (CD68+iNOS+CD163low)",
+      Lineage == "Myeloid" & CD68 == 1 & CD163 == 1 & CD206 == 1 ~
+        "M2 macrophage (CD68+CD163+CD206+)",
+      Lineage == "Myeloid" & CD68 == 1 ~
+        "Pan-macrophage (CD68+)",
+
+      TRUE ~ "Other/Unassigned"
+    )
+  ) %>%
+  select(-is_T, -is_B, -is_NK, -is_Myeloid, -n_lin)
+
+```
+
+## 2b. Assignment summary
+
+```{r assignment-summary, echo=FALSE}
+
+spatial_df_final %>%
+  count(Lineage) %>%
+  mutate(`%` = round(n / sum(n) * 100, 2)) %>%
+  arrange(desc(n)) %>%
+  kbl(caption = "Lineage assignment summary across all cells and samples") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+
+```
+
+```{r phenotype-summary-table, echo=FALSE}
+
+spatial_df_final %>%
+  filter(!Phenotype %in% c("Other/Unassigned", "Ambiguous/Double+")) %>%
+  count(Lineage, Phenotype) %>%
+  group_by(Lineage) %>%
+  mutate(`% of lineage` = round(n / sum(n) * 100, 2)) %>%
+  ungroup() %>%
+  arrange(Lineage, desc(n)) %>%
+  kbl(caption = "Phenotype composition within each lineage (excluding Other/Unassigned and Ambiguous)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  collapse_rows(columns = 1, valign = "top") %>%
+  scroll_box(width = "100%")
+
+```
+
+---
+
+# 3. Gating and Phenotyping QC
+
+```{r phenotyping-qc-fn, include=FALSE}
+
+phenotyping_qc_report <- function(
+  binary_result,
+  spatial_df_final,
+  markers,
+  phenotype_levels  = NULL,
+  sample_col        = "SampleID",
+  lineage_col       = "Lineage",
+  phenotype_col     = "Phenotype",
+  pos_rate_flag_lo  = 0.001,
+  pos_rate_flag_hi  = 0.50,
+  fallback_flag_pct = 0.25
+) {
+
+  if (!is.list(binary_result) || !"diagnostics" %in% names(binary_result))
+    stop("binary_result must be output of make_marker_binary(..., return_diagnostics = TRUE).")
+
+  missing_cols <- setdiff(c(sample_col, lineage_col, phenotype_col),
+                          names(spatial_df_final))
+  if (length(missing_cols) > 0)
+    stop("spatial_df_final missing column(s): ",
+         paste(missing_cols, collapse = ", "))
+
+  diag     <- binary_result$diagnostics
+  thr_long <- diag$thr_long
+  df       <- spatial_df_final
+  n_cells  <- nrow(df)
+
+  # ── Section 1: Gating diagnostics ───────────────────────────────────────────
+  gating_diag <- thr_long %>%
+    group_by(marker) %>%
+    summarise(
+      n_samples     = n(),
+      n_fallback    = sum(thr_equals_q_1_minus_mpr == TRUE, na.rm = TRUE),
+      pct_fallback  = round(n_fallback / n_samples * 100, 1),
+      mean_thr      = round(mean(thr, na.rm = TRUE), 4),
+      sd_thr        = round(sd(thr,  na.rm = TRUE), 4),
+      min_thr       = round(min(thr, na.rm = TRUE), 4),
+      max_thr       = round(max(thr, na.rm = TRUE), 4),
+      mean_pos_rate = round(mean(den_at_thr, na.rm = TRUE), 4),
+      sd_pos_rate   = round(sd(den_at_thr,   na.rm = TRUE), 4),
+      .groups       = "drop"
+    ) %>%
+    mutate(
+      flag_high_fallback = pct_fallback > fallback_flag_pct * 100,
+      flag_unstable_thr  = sd_thr > 0.15,
+      interpretation = case_when(
+        flag_high_fallback & flag_unstable_thr ~
+          "High fallback + unstable threshold: FDR likely too strict or cap too low",
+        flag_high_fallback ~
+          "High fallback: FDR unsatisfiable in many samples; relax fdr or raise cap",
+        flag_unstable_thr ~
+          "High threshold variance: heterogeneous staining; review per-sample violins",
+        TRUE ~ "OK"
+      )
+    ) %>%
+    arrange(desc(pct_fallback))
+
+  gating_diag_per_sample <- thr_long %>%
+    filter(thr_equals_q_1_minus_mpr == TRUE) %>%
+    select(sample = all_of(diag$group_col), marker,
+           thr, den_at_thr, q_1_minus_mpr) %>%
+    arrange(marker, sample)
+
+  # ── Section 2: Positive rate audit ──────────────────────────────────────────
+  hit_markers <- intersect(markers, names(df))
+
+  pos_rate_audit <- df %>%
+    select(all_of(c(sample_col, hit_markers))) %>%
+    pivot_longer(cols = all_of(hit_markers),
+                 names_to = "marker", values_to = "call") %>%
+    group_by(.data[[sample_col]], marker) %>%
+    summarise(
+      n_cells    = n(),
+      n_positive = sum(call == 1L, na.rm = TRUE),
+      pos_rate   = round(n_positive / n_cells, 5),
+      .groups    = "drop"
+    ) %>%
+    mutate(
+      flag_lo = pos_rate < pos_rate_flag_lo,
+      flag_hi = pos_rate > pos_rate_flag_hi,
+      flag    = flag_lo | flag_hi,
+      note    = case_when(
+        flag_lo ~ paste0("Positivity < ", pos_rate_flag_lo * 100,
+                         "% — possible staining failure or over-strict threshold"),
+        flag_hi ~ paste0("Positivity > ", pos_rate_flag_hi * 100,
+                         "% — possible non-specific staining or threshold too permissive"),
+        TRUE    ~ "OK"
+      )
+    ) %>%
+    arrange(desc(flag), marker, .data[[sample_col]])
+
+  pos_rate_summary <- pos_rate_audit %>%
+    group_by(marker) %>%
+    summarise(
+      mean_pos_rate = round(mean(pos_rate), 5),
+      sd_pos_rate   = round(sd(pos_rate),   5),
+      min_pos_rate  = round(min(pos_rate),   5),
+      max_pos_rate  = round(max(pos_rate),   5),
+      n_flag_lo     = sum(flag_lo),
+      n_flag_hi     = sum(flag_hi),
+      n_flagged     = sum(flag),
+      .groups       = "drop"
+    ) %>%
+    arrange(desc(n_flagged))
+
+  # ── Section 3: Phenotype rule audit (pre-hierarchy) ─────────────────────────
+  # Rules are derived from phenotype_levels: each named phenotype string is
+  # matched against the assigned Phenotype column independently, ignoring
+  # case_when priority order.
+  rule_audit <- NULL
+
+  if (!is.null(phenotype_levels)) {
+    all_phenotypes <- unlist(phenotype_levels, use.names = FALSE)
+    rule_audit <- map_dfr(all_phenotypes, function(ph) {
+      n_satisfy <- sum(df[[phenotype_col]] == ph, na.rm = TRUE)
+      tibble(
+        rule        = ph,
+        n_satisfy   = n_satisfy,
+        pct_satisfy = round(n_satisfy / n_cells * 100, 4)
+      )
+    }) %>%
+      arrange(desc(n_satisfy))
+  }
+
+  # ── Section 4: Rule collision audit ─────────────────────────────────────────
+  # Among cells assigned to each phenotype, what fraction were also the
+  # only-possible assignment (i.e. did the hierarchy resolve ambiguity)?
+  # This uses the lineage breakdown to surface where hierarchy does heavy lifting.
+  collision_audit <- NULL
+
+  if (!is.null(phenotype_levels)) {
+    all_phenotypes <- unlist(phenotype_levels, use.names = FALSE)
+
+    collision_audit <- map_dfr(all_phenotypes, function(ph) {
+      n_assigned <- sum(df[[phenotype_col]] == ph, na.rm = TRUE)
+      if (n_assigned == 0)
+        return(tibble(rule = ph, collides_with = "none",
+                      n_collision = 0L, pct_of_rule = 0))
+      others <- setdiff(all_phenotypes, ph)
+      map_dfr(others, function(other) {
+        n_col <- sum(df[[phenotype_col]] == ph &
+                     df[[lineage_col]] == df[[lineage_col]], na.rm = TRUE)
+        tibble(
+          rule          = ph,
+          collides_with = other,
+          n_collision   = sum(
+            df[[phenotype_col]] == ph &
+              df[[lineage_col]] %in%
+              names(which(sapply(phenotype_levels,
+                                 function(x) other %in% x))),
+            na.rm = TRUE
+          ),
+          pct_of_rule = round(n_collision / n_assigned * 100, 2)
+        )
+      })
+    }) %>%
+      filter(n_collision > 0) %>%
+      arrange(desc(pct_of_rule))
+  }
+
+  # ── Section 5: Lineage breakdown ─────────────────────────────────────────────
+  lineage_breakdown <- df %>%
+    group_by(.data[[sample_col]], .data[[lineage_col]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(.data[[sample_col]]) %>%
+    mutate(total_cells = sum(n), pct = round(n / total_cells * 100, 2)) %>%
+    ungroup() %>%
+    arrange(.data[[sample_col]], desc(n))
+
+  lineage_summary <- lineage_breakdown %>%
+    group_by(.data[[lineage_col]]) %>%
+    summarise(
+      mean_pct = round(mean(pct), 2), sd_pct = round(sd(pct), 2),
+      min_pct  = round(min(pct),  2), max_pct = round(max(pct), 2),
+      .groups  = "drop"
+    ) %>%
+    arrange(desc(mean_pct))
+
+  unassigned_flag <- lineage_breakdown %>%
+    filter(.data[[lineage_col]] %in% c("Other", "Other/Unassigned")) %>%
+    filter(pct > 50) %>%
+    select(all_of(sample_col), pct_unassigned = pct)
+
+  # ── Section 6: Phenotype breakdown ───────────────────────────────────────────
+  phenotype_breakdown <- df %>%
+    filter(!.data[[phenotype_col]] %in%
+             c("Other/Unassigned", "Ambiguous/Double+")) %>%
+    group_by(.data[[sample_col]], .data[[lineage_col]],
+             .data[[phenotype_col]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(.data[[sample_col]], .data[[lineage_col]]) %>%
+    mutate(lineage_total  = sum(n),
+           pct_of_lineage = round(n / lineage_total * 100, 2)) %>%
+    ungroup() %>%
+    arrange(.data[[sample_col]], .data[[lineage_col]], desc(n))
+
+  phenotype_summary <- phenotype_breakdown %>%
+    group_by(.data[[lineage_col]], .data[[phenotype_col]]) %>%
+    summarise(
+      mean_pct = round(mean(pct_of_lineage), 2),
+      sd_pct   = round(sd(pct_of_lineage),   2),
+      min_pct  = round(min(pct_of_lineage),   2),
+      max_pct  = round(max(pct_of_lineage),   2),
+      .groups  = "drop"
+    ) %>%
+    arrange(.data[[lineage_col]], desc(mean_pct))
+
+  # ── Section 7: Ambiguous / fallthrough ───────────────────────────────────────
+  fallthrough_summary <- df %>%
+    group_by(.data[[sample_col]]) %>%
+    summarise(
+      n_total        = n(),
+      n_ambiguous    = sum(.data[[phenotype_col]] == "Ambiguous/Double+",
+                           na.rm = TRUE),
+      n_unassigned   = sum(.data[[phenotype_col]] == "Other/Unassigned",
+                           na.rm = TRUE),
+      pct_ambiguous  = round(n_ambiguous  / n_total * 100, 2),
+      pct_unassigned = round(n_unassigned / n_total * 100, 2),
+      .groups        = "drop"
+    ) %>%
+    mutate(
+      flag_ambiguous  = pct_ambiguous  > 5,
+      flag_unassigned = pct_unassigned > 30,
+      note = case_when(
+        flag_ambiguous & flag_unassigned ~
+          "High ambiguous + high unassigned: review lineage caps and phenotype rule coverage",
+        flag_ambiguous  ~
+          "High ambiguous: lineage caps may be too permissive",
+        flag_unassigned ~
+          "High unassigned: phenotype rules do not cover many cells in this sample",
+        TRUE ~ "OK"
+      )
+    ) %>%
+    arrange(desc(pct_unassigned))
+
+  invisible(list(
+    gating_diag            = gating_diag,
+    gating_diag_per_sample = gating_diag_per_sample,
+    pos_rate_audit         = pos_rate_audit,
+    pos_rate_summary       = pos_rate_summary,
+    rule_audit             = rule_audit,
+    collision_audit        = collision_audit,
+    lineage_breakdown      = lineage_breakdown,
+    lineage_summary        = lineage_summary,
+    phenotype_breakdown    = phenotype_breakdown,
+    phenotype_summary      = phenotype_summary,
+    fallthrough_summary    = fallthrough_summary
+  ))
+}
+
+```
+
+```{r run-qc-report}
+
+qc_report <- phenotyping_qc_report(
+  binary_result    = binary_result,
+  spatial_df_final = spatial_df_final,
+  markers          = names(marker_fdr),
+  phenotype_levels = phenotype_levels,
+  sample_col       = sample_col,
+  lineage_col      = lineage_col,
+  phenotype_col    = phenotype_col
+)
+
+```
+
+## 3a. Gating diagnostics
+
+A **fallback** occurs when the Bayesian FDR constraint is unsatisfiable
+for a given marker × sample combination and the threshold defaults to the
+`min_pos_rate` quantile floor. High fallback rates suggest `fdr` is too
+strict or `max_pos_rate_cap` is too low for that marker. **Threshold
+instability** (high SD across samples) suggests heterogeneous staining or
+genuine biological variability across the cohort.
+
+```{r gating-diag-table, echo=FALSE}
+
+qc_report$gating_diag %>%
+  mutate(
+    pct_fallback       = paste0(pct_fallback, "%"),
+    flag_high_fallback = if_else(flag_high_fallback, "\u26a0 Yes", "\u2014"),
+    flag_unstable_thr  = if_else(flag_unstable_thr,  "\u26a0 Yes", "\u2014")
+  ) %>%
+  select(
+    Marker           = marker,
+    `Samples (n)`    = n_samples,
+    `Fallback (%)`   = pct_fallback,
+    `High fallback?` = flag_high_fallback,
+    `Mean thr`       = mean_thr,
+    `SD thr`         = sd_thr,
+    `Mean pos rate`  = mean_pos_rate,
+    Interpretation   = interpretation
+  ) %>%
+  kbl(caption = "Per-marker gating diagnostics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  column_spec(3, bold = TRUE,
+              color = if_else(qc_report$gating_diag$flag_high_fallback,
+                              FLAG_RED, "black")) %>%
+  column_spec(5, color = if_else(qc_report$gating_diag$flag_unstable_thr,
+                                 FLAG_ORANGE, "black")) %>%
+  scroll_box(width = "100%")
+
+```
+
+```{r gating-diag-plot, echo=FALSE, fig.height=5}
+
+binary_result$diagnostics$thr_long %>%
+  ggplot(aes(x = reorder(marker, thr, median), y = thr)) +
+  geom_boxplot(outlier.shape = NA, fill = NEUTRAL, linewidth = 0.5) +
+  geom_jitter(aes(color = thr_equals_q_1_minus_mpr),
+              width = 0.15, size = 1.5, alpha = 0.7) +
+  scale_color_manual(
+    values   = c("TRUE" = FLAG_RED, "FALSE" = "grey40"),
+    na.value = "grey80",
+    labels   = c("TRUE" = "Fallback", "FALSE" = "FDR-solved"),
+    name     = "Threshold type"
+  ) +
+  labs(
+    title    = "Threshold distribution by marker across samples",
+    subtitle = "Red = fallback to min_pos_rate floor",
+    x = "Marker", y = "Threshold value"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+
+```
+
+```{r gating-fallback-detail, echo=FALSE}
+
+if (nrow(qc_report$gating_diag_per_sample) > 0) {
+  qc_report$gating_diag_per_sample %>%
+    rename(Sample = sample, Marker = marker, Threshold = thr,
+           `Pos rate` = den_at_thr, `MPR quantile` = q_1_minus_mpr) %>%
+    kbl(caption = "Per-sample fallback details (fallback cases only)") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE) %>%
+    scroll_box(width = "100%", height = "400px")
+} else {
+  cat("\u2713 No fallback cases detected across any marker \u00d7 sample combination.\n")
+}
+
+```
+
+## 3b. Positive rate audit
+
+Positivity rates are the fraction of cells called positive per marker per
+sample. Unusually low rates suggest staining failure or an over-strict
+threshold. Unusually high rates suggest non-specific staining or an overly
+permissive threshold.
+
+```{r pos-rate-summary, echo=FALSE}
+
+qc_report$pos_rate_summary %>%
+  rename(Marker = marker, `Mean pos rate` = mean_pos_rate,
+         SD = sd_pos_rate, Min = min_pos_rate, Max = max_pos_rate,
+         `N flag low` = n_flag_lo, `N flag high` = n_flag_hi,
+         `N flagged` = n_flagged) %>%
+  kbl(caption = "Per-marker positivity rate summary across samples") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(8, bold = TRUE,
+              color = if_else(qc_report$pos_rate_summary$n_flagged > 0,
+                              FLAG_RED, "black")) %>%
+  scroll_box(width = "100%")
+
+```
+
+```{r pos-rate-heatmap, echo=FALSE, fig.height=6}
+
+qc_report$pos_rate_audit %>%
+  mutate(pos_rate_pct = pos_rate * 100) %>%
+  ggplot(aes(x = .data[[sample_col]], y = marker, fill = pos_rate_pct)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = if_else(flag, "\u26a0", "")),
+            size = 3, color = "black") +
+  scale_fill_viridis_c(option = "magma", direction = -1,
+                       name = "Positivity (%)", limits = c(0, NA)) +
+  labs(title    = "Marker positivity rates by sample",
+       subtitle = "\u26a0 = flagged (unexpectedly low or high)",
+       x = "Sample", y = "Marker") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 50, hjust = 1, size = 8),
+        panel.grid  = element_blank())
+
+```
+
+```{r pos-rate-flagged, echo=FALSE}
+
+flagged_pos <- filter(qc_report$pos_rate_audit, flag)
+if (nrow(flagged_pos) > 0) {
+  flagged_pos %>%
+    select(Sample = all_of(sample_col), Marker = marker,
+           `N cells` = n_cells, `N positive` = n_positive,
+           `Pos rate` = pos_rate, Note = note) %>%
+    kbl(caption = "Flagged marker \u00d7 sample combinations") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE) %>%
+    scroll_box(width = "100%", height = "400px")
+} else {
+  cat("\u2713 No marker \u00d7 sample combinations flagged.\n")
+}
+
+```
+
+## 3c. Phenotype rule audit
+
+Each phenotype label is evaluated against the assigned `Phenotype` column
+independently, showing how many cells received that label. This makes visible
+where the `case_when` hierarchy is doing heavy lifting — a phenotype with very
+few assigned cells but a biologically expected prevalence may indicate a rule
+conflict or ordering issue.
+
+```{r rule-audit, echo=FALSE}
+
+if (!is.null(qc_report$rule_audit)) {
+  qc_report$rule_audit %>%
+    rename(Phenotype = rule, `N assigned` = n_satisfy,
+           `% of all cells` = pct_satisfy) %>%
+    kbl(caption = "Phenotype assignment counts") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE) %>%
+    column_spec(2, bold = TRUE) %>%
+    scroll_box(width = "100%")
+} else {
+  cat("Skipped \u2014 pass `phenotype_levels` to enable.\n")
+}
+
+```
+
+```{r rule-audit-plot, echo=FALSE, fig.height=5}
+
+if (!is.null(qc_report$rule_audit)) {
+  qc_report$rule_audit %>%
+    mutate(rule = fct_reorder(rule, pct_satisfy)) %>%
+    ggplot(aes(x = rule, y = pct_satisfy)) +
+    geom_col(fill = NEUTRAL, color = "grey40", linewidth = 0.3) +
+    geom_text(aes(label = paste0(round(pct_satisfy, 3), "%")),
+              hjust = -0.1, size = 3.2) +
+    coord_flip(clip = "off") +
+    expand_limits(y = max(qc_report$rule_audit$pct_satisfy) * 1.25) +
+    labs(title = "Phenotype assignment rates",
+         x = NULL, y = "% of all cells") +
+    theme_bw(base_size = 12)
+}
+
+```
+
+## 3d. Lineage breakdown
+
+```{r lineage-summary, echo=FALSE}
+
+qc_report$lineage_summary %>%
+  rename(Lineage = all_of(lineage_col), `Mean %` = mean_pct,
+         `SD %` = sd_pct, `Min %` = min_pct, `Max %` = max_pct) %>%
+  kbl(caption = "Lineage composition summary across samples") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+```
+
+```{r lineage-stacked-bar, echo=FALSE, fig.height=6}
+
+qc_report$lineage_breakdown %>%
+  mutate(!!sample_col := fct_reorder(
+    .data[[sample_col]],
+    if_else(.data[[lineage_col]] == "Other", pct, 0),
+    .fun = sum
+  )) %>%
+  ggplot(aes(x = .data[[sample_col]], y = pct,
+             fill = .data[[lineage_col]])) +
+  geom_col(position = "stack", linewidth = 0.2, color = "white") +
+  scale_fill_brewer(palette = "Set2", name = "Lineage") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title    = "Lineage composition per sample",
+       subtitle = "Ordered by Other fraction",
+       x = "Sample", y = "% of total cells") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 50, hjust = 1))
+
+```
+
+```{r lineage-boxplot, echo=FALSE, fig.height=4}
+
+qc_report$lineage_breakdown %>%
+  ggplot(aes(x = reorder(.data[[lineage_col]], pct, median), y = pct)) +
+  geom_boxplot(fill = NEUTRAL, outlier.shape = NA, linewidth = 0.5) +
+  geom_jitter(width = 0.15, size = 1.5, alpha = 0.6, color = "grey30") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Lineage abundance distribution across samples",
+       x = NULL, y = "% of total cells") +
+  theme_bw(base_size = 12) +
+  coord_flip()
+
+```
+
+## 3e. Phenotype breakdown
+
+```{r phenotype-breakdown-table, echo=FALSE}
+
+qc_report$phenotype_summary %>%
+  rename(Lineage = all_of(lineage_col), Phenotype = all_of(phenotype_col),
+         `Mean % of lineage` = mean_pct, `SD %` = sd_pct,
+         `Min %` = min_pct, `Max %` = max_pct) %>%
+  kbl(caption = "Phenotype composition within lineage, averaged across samples") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  collapse_rows(columns = 1, valign = "top") %>%
+  scroll_box(width = "100%")
+
+```
+
+```{r phenotype-breakdown-plot, echo=FALSE, fig.height=8}
+
+qc_report$phenotype_breakdown %>%
+  mutate(Phenotype = str_wrap(.data[[phenotype_col]], width = 35)) %>%
+  ggplot(aes(x = reorder(Phenotype, pct_of_lineage, median),
+             y = pct_of_lineage)) +
+  geom_boxplot(fill = NEUTRAL, outlier.shape = NA, linewidth = 0.4) +
+  geom_jitter(width = 0.15, size = 1.2, alpha = 0.55, color = "grey30") +
+  facet_wrap(vars(.data[[lineage_col]]), scales = "free", ncol = 2) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Phenotype abundance within lineage across samples",
+       x = NULL, y = "% of lineage cells") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.y = element_text(size = 8)) +
+  coord_flip()
+
+```
+
+## 3f. Ambiguous and unassigned cells
+
+Cells labeled `Ambiguous/Double+` satisfied multiple lineage rules
+simultaneously. Cells labeled `Other/Unassigned` passed lineage assignment
+but matched no phenotype rule. High rates of either suggest lineage cap
+settings or phenotype rule gaps that need attention.
+
+```{r fallthrough-table, echo=FALSE}
+
+qc_report$fallthrough_summary %>%
+  select(Sample = all_of(sample_col), `N total` = n_total,
+         `N ambiguous` = n_ambiguous, `% ambiguous` = pct_ambiguous,
+         `N unassigned` = n_unassigned, `% unassigned` = pct_unassigned,
+         `Flag ambiguous` = flag_ambiguous,
+         `Flag unassigned` = flag_unassigned, Note = note) %>%
+  mutate(`Flag ambiguous`  = if_else(`Flag ambiguous`,  "\u26a0 Yes", "\u2014"),
+         `Flag unassigned` = if_else(`Flag unassigned`, "\u26a0 Yes", "\u2014")) %>%
+  kbl(caption = "Ambiguous and unassigned cell rates per sample") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  column_spec(4, color = if_else(qc_report$fallthrough_summary$flag_ambiguous,
+                                 FLAG_RED, "black")) %>%
+  column_spec(6, color = if_else(qc_report$fallthrough_summary$flag_unassigned,
+                                 FLAG_RED, "black")) %>%
+  scroll_box(width = "100%")
+
+```
+
+```{r fallthrough-plot, echo=FALSE, fig.height=5}
+
+qc_report$fallthrough_summary %>%
+  pivot_longer(cols = c(pct_ambiguous, pct_unassigned),
+               names_to = "type", values_to = "pct") %>%
+  mutate(
+    type   = recode(type, pct_ambiguous  = "Ambiguous/Double+",
+                          pct_unassigned = "Other/Unassigned"),
+    sample = fct_reorder(.data[[sample_col]], pct, max)
+  ) %>%
+  ggplot(aes(x = sample, y = pct, fill = type)) +
+  geom_col(position = "dodge", linewidth = 0.3, color = "white") +
+  scale_fill_manual(values = c("Ambiguous/Double+" = FLAG_ORANGE,
+                               "Other/Unassigned"  = FLAG_RED),
+                    name = NULL) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title    = "Ambiguous and unassigned rates per sample",
+       subtitle = "Ordered by maximum of the two rates",
+       x = "Sample", y = "% of total cells") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x   = element_text(angle = 50, hjust = 1),
+        legend.position = "top")
+
+```
+
+---
+
+# 4. Abundance Summary
+
+Per-sample phenotype proportions out of total cells (including
+`Other/Unassigned` and `Ambiguous/Double+` in the denominator). These are
+the primary inputs to downstream statistical analysis.
+
+```{r prepare-phenotype-summary-fn, include=FALSE}
+
+prepare_phenotype_summary_from_image <- function(
+  df,
+  cohort_patterns    = NULL,
+  image_col          = "ImageID",
+  sample_col         = "SampleID",
+  lineage_col        = "Lineage",
+  exclude_phenotypes = c("Other/Unassigned", "Ambiguous/Double+"),
+  normalize_within   = NULL,
+  phenotype_levels   = NULL,
+  lineage_levels     = NULL,
+  cohort_levels      = NULL,
+  ignore_case        = TRUE,
+  warn_parse         = TRUE,
+  cohort_id_col      = "ImageID"
+) {
+  missing_cols <- setdiff(c(image_col, sample_col, lineage_col, "Phenotype"),
+                          names(df))
+  if (length(missing_cols) > 0)
+    stop("`df` is missing required column(s): ",
+         paste(missing_cols, collapse = ", "))
+  if (!cohort_id_col %in% names(df))
+    stop(sprintf("cohort_id_col = '%s' not found in `df`.", cohort_id_col))
+
+  df <- mutate(df, across(
+    all_of(c(image_col, sample_col, lineage_col, "Phenotype", cohort_id_col)),
+    as.character
+  ))
+
+  # Denominators computed before any filtering
+  totals_df <- df %>%
+    group_by(.data[[sample_col]]) %>%
+    summarise(total_cells = n(), .groups = "drop")
+
+  df <- if (!is.null(cohort_patterns) && length(cohort_patterns) > 0) {
+    pats         <- as.character(cohort_patterns)
+    cohort_names <- if (is.null(names(cohort_patterns)) ||
+                        any(names(cohort_patterns) == ""))
+      pats else names(cohort_patterns)
+    parse_one <- function(z) {
+      if (is.na(z) || !nzchar(z)) return(NA_character_)
+      hit <- vapply(pats, function(p)
+        grepl(p, z, ignore.case = ignore_case, perl = TRUE), logical(1))
+      if (any(hit)) cohort_names[which(hit)[1]] else NA_character_
+    }
+    out <- mutate(df, Cohort = vapply(.data[[cohort_id_col]],
+                                      parse_one, character(1)))
+    if (warn_parse) {
+      unmatched <- out %>%
+        filter(is.na(Cohort)) %>%
+        distinct(.data[[cohort_id_col]]) %>%
+        pull(.data[[cohort_id_col]])
+      if (length(unmatched) > 0)
+        warning(sprintf(
+          "Cohort parsing: %d unique `%s` value(s) had no match: %s%s",
+          length(unmatched), cohort_id_col,
+          paste(head(unmatched, 10), collapse = ", "),
+          if (length(unmatched) > 10) " ..." else ""
+        ), call. = FALSE)
+    }
+    out
+  } else if ("Cohort" %in% names(df)) {
+    mutate(df, Cohort = as.character(Cohort))
+  } else {
+    mutate(df, Cohort = "All samples")
+  }
+
+  df <- filter(df, !is.na(Cohort), nzchar(Cohort))
+  if (nrow(df) == 0) stop("No rows remain after cohort parsing/filtering.")
+
+  observed_cohorts <- unique(df$Cohort)
+
+  if (!is.null(cohort_levels) && length(cohort_levels) > 0) {
+    valid_levels <- intersect(cohort_levels, observed_cohorts)
+    if (length(valid_levels) == 0)
+      stop("`cohort_levels` has no overlap with parsed cohorts.\n",
+           "Parsed: ",   paste(observed_cohorts, collapse = ", "), "\n",
+           "Supplied: ", paste(cohort_levels,    collapse = ", "))
+    dropped <- setdiff(observed_cohorts, valid_levels)
+    if (warn_parse && length(dropped) > 0)
+      warning("Dropping cohort(s) not in `cohort_levels`: ",
+              paste(dropped, collapse = ", "), call. = FALSE)
+    df            <- filter(df, Cohort %in% valid_levels)
+    cohort_levels <- valid_levels
+  } else {
+    cohort_levels <- observed_cohorts
+  }
+
+  df <- mutate(df, Cohort = factor(Cohort, levels = cohort_levels))
+
+  df_f <- df %>%
+    filter(!is.na(.data[[lineage_col]]), nzchar(.data[[lineage_col]]),
+           !is.na(Phenotype), nzchar(Phenotype),
+           !Phenotype %in% exclude_phenotypes)
+
+  if (nrow(df_f) == 0) stop("No rows remain after lineage/phenotype filtering.")
+
+  expected_phenotypes <- if (!is.null(phenotype_levels) &&
+                              length(phenotype_levels) > 0) {
+    lapply(phenotype_levels,
+           function(v) unique(na.omit(as.character(v))))
+  } else {
+    tmp <- df_f %>%
+      distinct(.data[[lineage_col]], Phenotype) %>%
+      arrange(.data[[lineage_col]], Phenotype)
+    split(as.character(tmp$Phenotype), tmp[[lineage_col]])
+  }
+
+  expected_phenotypes <- expected_phenotypes[lengths(expected_phenotypes) > 0]
+
+  lineage_levels <- if (is.null(lineage_levels) || length(lineage_levels) == 0)
+    names(expected_phenotypes)
+  else
+    intersect(lineage_levels, names(expected_phenotypes))
+
+  if (length(lineage_levels) == 0)
+    stop("No lineage levels remain after intersecting with observed lineages.")
+
+  expected_phenotypes <- expected_phenotypes[lineage_levels]
+
+  lineage_pheno_tbl <- imap_dfr(
+    expected_phenotypes,
+    ~ tibble(!!lineage_col := .y, Phenotype = .x, .ord = seq_along(.x))
+  ) %>%
+    arrange(factor(.data[[lineage_col]], levels = lineage_levels), .ord) %>%
+    select(-.ord)
+
+  pheno_levels_global <- unique(lineage_pheno_tbl$Phenotype)
+
+  counts <- df_f %>%
+    count(.data[[sample_col]], Cohort, .data[[lineage_col]],
+          Phenotype, name = "n")
+
+  sample_cohort <- distinct(df, .data[[sample_col]], Cohort)
+
+  x <- tidyr::crossing(sample_cohort, lineage_pheno_tbl) %>%
+    left_join(counts, by = c(sample_col, "Cohort", lineage_col, "Phenotype")) %>%
+    mutate(n = tidyr::replace_na(n, 0L)) %>%
+    left_join(totals_df, by = sample_col) %>%
+    mutate(prop_total = if_else(total_cells > 0, n / total_cells, 0))
+
+  if (!is.null(normalize_within) && length(normalize_within) > 0) {
+    normalize_within <- intersect(as.character(normalize_within), lineage_levels)
+    x <- x %>%
+      group_by(.data[[sample_col]]) %>%
+      mutate(
+        .within_denom = sum(
+          n[as.character(.data[[lineage_col]]) %in% normalize_within],
+          na.rm = TRUE
+        ),
+        prop_within = if_else(
+          as.character(.data[[lineage_col]]) %in% normalize_within &
+            .within_denom > 0,
+          n / .within_denom,
+          NA_real_
+        )
+      ) %>%
+      ungroup() %>%
+      select(-.within_denom)
+  }
+
+  x %>%
+    mutate(
+      Cohort        = factor(as.character(Cohort), levels = cohort_levels),
+      !!lineage_col := factor(as.character(.data[[lineage_col]]),
+                              levels = lineage_levels),
+      Phenotype     = factor(as.character(Phenotype),
+                             levels = pheno_levels_global)
+    ) %>%
+    arrange(.data[[sample_col]], Cohort,
+            .data[[lineage_col]], Phenotype) %>%
+    select(all_of(sample_col), Cohort, all_of(lineage_col), Phenotype,
+           n, total_cells, starts_with("prop_"))
+}
+
+```
+
+```{r abundance}
+
+abundance_plot_df <- spatial_df_final %>%
+  prepare_phenotype_summary_from_image(
+    cohort_patterns  = NULL,
+    cohort_id_col    = "SubjectID",
+    image_col        = "ImageID",
+    sample_col       = "SampleID",
+    lineage_col      = "Lineage",
+    phenotype_levels = phenotype_levels,
+    lineage_levels   = names(phenotype_levels)
+  )
+
+cat("abundance_plot_df:",
+    format(nrow(abundance_plot_df), big.mark = ","), "rows\n")
+cat("Samples:", n_distinct(abundance_plot_df$SampleID), "\n")
+cat("Phenotypes:", n_distinct(abundance_plot_df$Phenotype), "\n")
+
+```
+
+---
+
+# 5. Save Outputs
+
+```{r save}
+
+out_dir <- file.path(dirname(cfg_path), cfg$paths$folders$results)
+
+fwrite(
+  spatial_df_final,
+  file.path(out_dir, "spatial_phenotype_assignment.csv")
+)
+
+fwrite(
+  abundance_plot_df,
+  file.path(out_dir, "abundance_plot_data.csv")
+)
+
+saveRDS(
+  phenotype_levels,
+  file.path(out_dir, "phenotype_levels.rds")
+)
+
+cat("Saved:\n")
+cat("  spatial_phenotype_assignment.csv\n")
+cat("  abundance_plot_data.csv\n")
+cat("  phenotype_levels.rds\n")
+cat("Output directory:", out_dir, "\n")
+
+```
+
+---
+
+# Session Information
+
+```{r session}
+
+sessionInfo()
+
+```

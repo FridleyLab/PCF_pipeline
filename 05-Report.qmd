@@ -1,0 +1,1495 @@
+---
+title: "PCF Pilot Results: Brooke Fridley"
+subtitle: "Fridley Lab"
+author: "Kirill Sabitov"
+date: today
+date-format: long
+execute:
+  echo: true
+  eval: true
+  warning: false
+  error: false
+  message: false
+format:
+    pdf:
+      toc: true
+      echo: false
+      warning: false
+      error: false
+      message: false
+    html:
+      toc: true
+      toc-depth: 5
+      toc-location: left
+      toc-title: "Report Contents"
+      number-sections: false
+      embed-resources: true
+      code-link: true
+      code-fold: true
+      code-summary: "Show the code"
+      page-layout: full
+      df-print: paged
+output: html_document
+---
+
+```{r Packages and Data, echo = F, include = F}
+
+# devtools::install_github("JiangmeiRubyXiong/cfGMM")
+# devtools::install_github("JiangmeiRubyXiong/GammaGateR", build_vignettes = FALSE)
+
+.libPaths("/mnt/project/blfridley/PCF_pilots/_common/R/renv/library/linux-rhel-8.10/R-4.4/x86_64-pc-linux-gnu")
+options(gt.markdown_engine = "markdown")
+
+suppressPackageStartupMessages({
+  library(pacman); library(devtools)
+  library(yaml)
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+  library(knitr)
+  library(tidyr)
+  library(gtsummary)
+  library(ggpubr)
+  library(forcats)
+  library(rstatix)
+  library(kableExtra)
+  library(htmltools)
+  library(htmlwidgets)
+  library(stringi)
+  library(stringr)
+  library(rlang)
+  library(gt)
+  library(rmarkdown)
+  library(spatialTIME)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(scales)
+  library(skimr)
+  library(purrr)
+  library(knitr)
+  library(grid)
+  library(patchwork)
+  library(cowplot)
+  library(RColorBrewer)
+  library(scattermore)
+  library(sass)
+  library(cards)
+  library(markdown)
+  library(commonmark)
+  library(litedown)
+  library(ComplexUpset)
+  library(treemapify)
+})
+
+cfg_path <- normalizePath("../config.yml", mustWork = T)
+cfg <- read_yaml(cfg_path)
+
+spatial_df_final <- fread(file.path(dirname(cfg_path), cfg$paths$folders$results, "spatial_phenotype_assignment.csv")) %>% 
+  as.data.frame()
+
+abundance_plot_df <- fread(file.path(dirname(cfg_path), cfg$paths$folders$results, "abundance_plot_data.csv")) %>% 
+  as.data.frame()
+
+phenotype_levels <- readRDS(file.path(dirname(cfg_path), cfg$paths$folders$results, "phenotype_levels.rds"))
+
+metadata <- readxl::read_excel({
+  f <- fs::dir_ls(
+    file.path(dirname(cfg_path), cfg$paths$folders$pcf_images),
+    recurse = FALSE,
+    type = "file",
+    regexp = "(?i)\\.(xlsx|xls)$"
+  )
+  f <- f[!stringr::str_detect(basename(f), "^~\\$")]
+  f <- f[stringr::str_detect(
+    basename(f),
+    stringr::regex(cfg$metadata$pattern %||% "PCF_meta_data", ignore_case = TRUE)
+  )]
+  if (length(f) != 1)
+    stop(if (length(f) == 0)
+      "No Excel file found matching metadata pattern."
+    else
+      "Multiple Excel files found matching metadata pattern.")
+  f
+})
+
+color_vec <- if("Class" %in% names(metadata)){
+  setNames(metadata$Class, metadata$SampleID)
+} else {
+  NULL
+}
+
+cohort_levels <- sapply(cfg$cohorts$groups, function(x) x$label)
+
+```
+
+```{r Functions, echo = F, include = F}
+
+## These functions are defined below to make various visualizations throughout the report. 
+## They are designed to be generalizable, but you may edit them depending on the pilot's needs. 
+## Recommended that you "fold" this chunk (press triangle next to line number) unless you need to edit code. 
+
+plot_lineage <- function(
+  x_df,
+  lineage_label            = NULL,
+  ncol                     = 3,
+  add_tests                = TRUE,
+  point_alpha              = 0.6,
+  point_size               = 1.6,
+  box_width                = 0.65,
+  pairwise_if_omnibus_sig  = TRUE,
+  omnibus_alpha            = 0.05,
+  subtitle                 = NULL,
+  theme_base               = theme_minimal(base_size = 11),
+  phenotype_levels         = NULL,
+  cohort_levels            = NULL,
+  statisticallycorrect     = TRUE,
+  show_ns                  = TRUE,
+  color_by                 = NULL,
+  color_by_id_col          = "SampleID"
+) {
+
+  # ── Validation ───────────────────────────────────────────────────────────────
+  missing_cols <- setdiff(c("Lineage", "Phenotype", "prop_total"), names(x_df))
+  if (length(missing_cols) > 0)
+    stop("Missing required column(s): ", paste(missing_cols, collapse = ", "))
+
+  if (!is.null(color_by)) {
+    if (!is.character(color_by) || is.null(names(color_by)))
+      stop("`color_by` must be a named character vector (names = sample IDs, values = group labels).")
+    if (!color_by_id_col %in% names(x_df))
+      stop("`color_by_id_col` '", color_by_id_col, "' not found in x_df.")
+  }
+
+  if (!"Cohort" %in% names(x_df))
+    x_df <- mutate(x_df, Cohort = "All samples")
+
+  # ── Helpers ──────────────────────────────────────────────────────────────────
+  signif_label <- function(p) case_when(
+    is.na(p)  ~ NA_character_,
+    p <= 1e-4 ~ "****",
+    p <= 1e-3 ~ "***",
+    p <= 1e-2 ~ "**",
+    p <= 5e-2 ~ "*",
+    TRUE      ~ "ns"
+  )
+
+  fmt_p <- function(p)
+    ifelse(is.na(p), NA_character_,
+           ifelse(p < 0.001, "<0.001", format(signif(p, 2), trim = TRUE)))
+
+  has_variation <- function(v) any(is.finite(v)) && sd(v, na.rm = TRUE) > 0
+
+  safe_wilcox_p <- function(x, g) {
+    g  <- droplevels(g)
+    if (nlevels(g) != 2) return(NA_real_)
+    x1 <- x[g == levels(g)[1]]; x2 <- x[g == levels(g)[2]]
+    if (!length(x1) || !length(x2)) return(NA_real_)
+    if (!any(is.finite(x1)) || !any(is.finite(x2))) return(NA_real_)
+    if (sd(x1, na.rm = TRUE) == 0 && sd(x2, na.rm = TRUE) == 0 &&
+        mean(x1, na.rm = TRUE) == mean(x2, na.rm = TRUE)) return(1)
+    tryCatch(wilcox.test(x1, x2, exact = FALSE, conf.int = FALSE)$p.value,
+             error = function(e) NA_real_)
+  }
+
+  percent_breaks_pretty5 <- function() {
+    function(lims) {
+      hi <- if (!is.finite(lims[2]) || lims[2] <= 0) 0.0004 else lims[2]
+      px <- pretty(c(0, hi * 100), n = 4, min.n = 3)
+      br <- sort(unique(c(0, px[px > 0]))) / 100
+      if (length(br) > 5) {
+        idx <- round(seq(1, length(br), length.out = 5))
+        br  <- c(0, br[unique(idx[-1])])
+      } else if (length(br) < 5) {
+        nice_steps <- c(1e-6, 2e-6, 5e-6, 1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4,
+                        0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00)
+        idx  <- which(nice_steps * 4 >= hi)
+        step <- if (length(idx)) nice_steps[idx[1]] else tail(nice_steps, 1)
+        br   <- seq(0, step * 4, by = step)
+      }
+      br
+    }
+  }
+
+  percent_labels_distinct <- function() {
+    function(x) {
+      ux   <- sort(unique(x[is.finite(x)]))
+      step <- if (length(ux) >= 2) min(diff(ux)) else 0
+      d    <- if (step > 0) max(0, min(4, ceiling(-log10(step * 100 + 1e-12)))) else 2
+      fmt  <- function(v, k) paste0(formatC(v * 100, format = "f", digits = k), "%")
+      lab  <- fmt(x, d)
+      while (any(duplicated(lab)) && d < 4) { d <- d + 1; lab <- fmt(x, d) }
+      lab
+    }
+  }
+
+  y_pos_rel <- function(ymax, rank = 1L, rel_start = 0.12, rel_gap = 0.08) {
+    rank <- as.integer(rank)
+    add  <- rel_start + (rank - 1L) * rel_gap
+    ifelse(is.finite(ymax) & ymax > 0,
+           ymax * (1 + add),
+           0.01 * (1 + (rank - 1L) * 0.8))
+  }
+
+  # ── Data prep ─────────────────────────────────────────────────────────────────
+  df <- filter(x_df, Phenotype != "Other/Unassigned")
+
+  if (!is.null(lineage_label))
+    df <- filter(df, Lineage == lineage_label)
+
+  df <- if (!is.null(cohort_levels)) {
+    mutate(df, Cohort = factor(Cohort, levels = cohort_levels))
+  } else {
+    mutate(df, Cohort = forcats::fct_inorder(as.character(Cohort))) %>% 
+      forcats::fct_na_level_to_value("All samples")
+  }
+  cohort_levels <- levels(df$Cohort)
+
+  if (nrow(df) == 0)
+    return(
+      ggplot() +
+        annotate("text", x = 0.5, y = 0.5, size = 5,
+                 label = paste("No data for plot; lineage:",
+                               ifelse(is.null(lineage_label), "ALL", lineage_label))) +
+        theme_void() + ggtitle("Phenotype proportions by cohort")
+    )
+
+  facet_levels <- if (is.list(phenotype_levels) && length(phenotype_levels) > 0) {
+    if (!is.null(lineage_label) && lineage_label %in% names(phenotype_levels))
+      phenotype_levels[[lineage_label]]
+    else
+      unlist(phenotype_levels, use.names = FALSE)
+  } else {
+    unique(as.character(df$Phenotype))
+  }
+
+  df <- mutate(df,
+               Phenotype_chr = as.character(Phenotype),
+               Phenotype_f   = factor(Phenotype_chr, levels = facet_levels, ordered = TRUE))
+
+  # ── color_by join ─────────────────────────────────────────────────────────────
+  use_color <- !is.null(color_by)
+
+  if (use_color) {
+    color_map <- tibble(
+      !!color_by_id_col := names(color_by),
+      .color_group       = unname(color_by)
+    )
+    df <- left_join(df, color_map, by = color_by_id_col)
+  } else {
+    df <- mutate(df, .color_group = NA_character_)
+  }
+
+  observed_cohort_lvls <- cohort_levels[
+    cohort_levels %in% unique(as.character(df$Cohort[!is.na(df$Cohort)]))
+  ]
+  n_groups <- length(observed_cohort_lvls)
+  can_test  <- isTRUE(add_tests) && n_groups %in% c(2, 3)
+
+  # ── Panel maxima ──────────────────────────────────────────────────────────────
+  peaks <- df %>%
+    group_by(Phenotype_f) %>%
+    summarise(ymax = max(prop_total, na.rm = TRUE), .groups = "drop") %>%
+    mutate(ymax = ifelse(is.infinite(ymax), NA_real_, ymax))
+
+  # ── Omnibus tests ─────────────────────────────────────────────────────────────
+  strip_levels <- levels(df$Phenotype_f)
+  omnibus      <- NULL
+
+  if (can_test) {
+    df_nonmiss <- filter(df, !is.na(prop_total))
+
+    omnibus <- if (n_groups == 2) {
+      df_nonmiss %>%
+        group_by(Phenotype_f) %>%
+        summarise(p = safe_wilcox_p(prop_total, Cohort), .groups = "drop") %>%
+        mutate(Phenotype_f = as.character(Phenotype_f),
+               p_txt = if_else(is.na(p), NA_character_,
+                               paste0("Wilcoxon p = ", fmt_p(p))))
+    } else {
+      df_nonmiss %>%
+        group_by(Phenotype_f) %>%
+        filter(has_variation(prop_total)) %>%
+        ungroup() %>%
+        group_by(Phenotype_f) %>%
+        rstatix::kruskal_test(prop_total ~ Cohort) %>%
+        ungroup() %>%
+        mutate(Phenotype_f = as.character(Phenotype_f),
+               p_txt = paste0("Kruskal–Wallis p = ", fmt_p(p)))
+    }
+
+    p_text <- setNames(omnibus$p_txt, omnibus$Phenotype_f)
+
+    strip_labels_expr <- setNames(
+      ifelse(
+        is.na(p_text[strip_levels]),
+        paste0("bold('", gsub("'", "\\\\'", strip_levels, fixed = TRUE), "')"),
+        paste0("atop(bold('", gsub("'", "\\\\'", strip_levels, fixed = TRUE),
+               "'), '", gsub("'", "\\\\'", p_text[strip_levels], fixed = TRUE), "')")
+      ),
+      strip_levels
+    )
+  } else {
+    strip_labels_expr <- setNames(
+      paste0("bold('", gsub("'", "\\\\'", strip_levels, fixed = TRUE), "')"),
+      strip_levels
+    )
+  }
+
+  # ── Pairwise comparisons ──────────────────────────────────────────────────────
+  pairwise_df <- NULL
+
+  if (can_test) {
+    df_nonmiss <- filter(df, !is.na(prop_total))
+
+    if (n_groups == 2) {
+      pairwise_df <- omnibus %>%
+        filter(!is.na(p)) %>%
+        transmute(
+          Phenotype_f  = Phenotype_f,
+          group1       = observed_cohort_lvls[1],
+          group2       = observed_cohort_lvls[2],
+          p.adj        = p,
+          p.adj.signif = signif_label(p)
+        ) %>%
+        left_join(peaks, by = "Phenotype_f") %>%
+        mutate(y.position = y_pos_rel(ymax, rank = 1L)) %>%
+        filter(!is.na(p.adj.signif)) %>%
+        select(-ymax)
+
+    } else if (isTRUE(statisticallycorrect)) {
+      eligible <- if (isTRUE(pairwise_if_omnibus_sig) && !is.null(omnibus)) {
+        filter(omnibus, !is.na(p) & p < omnibus_alpha) %>% select(Phenotype_f)
+      } else {
+        distinct(df, Phenotype_f) %>% mutate(Phenotype_f = as.character(Phenotype_f))
+      }
+
+      keep3 <- df_nonmiss %>%
+        semi_join(eligible, by = "Phenotype_f") %>%
+        group_by(Phenotype_f) %>%
+        summarise(k = n_distinct(Cohort), .groups = "drop") %>%
+        filter(k == 3)
+
+      if (nrow(keep3) > 0) {
+        pairwise_df <- df_nonmiss %>%
+          semi_join(keep3, by = "Phenotype_f") %>%
+          group_by(Phenotype_f) %>%
+          rstatix::dunn_test(prop_total ~ Cohort, p.adjust.method = "BH") %>%
+          ungroup() %>%
+          mutate(
+            group1       = as.character(group1),
+            group2       = as.character(group2),
+            span         = abs(match(group2, cohort_levels) - match(group1, cohort_levels)),
+            p.adj.signif = signif_label(p.adj)
+          ) %>%
+          group_by(Phenotype_f) %>%
+          arrange(span, group1, group2, .by_group = TRUE) %>%
+          mutate(rank = row_number()) %>%
+          ungroup() %>%
+          left_join(peaks, by = "Phenotype_f") %>%
+          mutate(y.position = y_pos_rel(ymax, rank = rank)) %>%
+          filter(!is.na(p.adj.signif)) %>%
+          select(-span, -rank, -ymax)
+      }
+
+    } else {
+      ref_level <- observed_cohort_lvls[1]
+      others    <- setdiff(observed_cohort_lvls, ref_level)
+
+      pairwise_df <- expand.grid(
+        Phenotype_f = levels(df$Phenotype_f),
+        group2      = others,
+        stringsAsFactors = FALSE
+      ) %>%
+        mutate(group1 = ref_level) %>%
+        rowwise() %>%
+        mutate(p = {
+          sub <- df_nonmiss %>%
+            filter(as.character(Phenotype_f) == .data$Phenotype_f,
+                   as.character(Cohort) %in% c(group1, group2))
+          if (n_distinct(sub$Cohort) < 2) 1 else safe_wilcox_p(sub$prop_total, droplevels(sub$Cohort))
+        }) %>%
+        ungroup() %>%
+        group_by(Phenotype_f) %>%
+        mutate(
+          p.adj        = p.adjust(p, method = "BH"),
+          p.adj.signif = signif_label(p.adj),
+          rank         = match(group2, others)
+        ) %>%
+        ungroup() %>%
+        left_join(peaks, by = "Phenotype_f") %>%
+        mutate(y.position = y_pos_rel(ymax, rank = rank)) %>%
+        filter(!is.na(p.adj.signif)) %>%
+        select(-rank, -ymax)
+    }
+  }
+
+  top_expand <- if (!is.null(pairwise_df) && nrow(pairwise_df) > 0) 0.18 else 0.06
+
+  # ── Plot ──────────────────────────────────────────────────────────────────────
+  p <- ggplot(df, aes(x = Cohort, y = prop_total)) +
+    geom_boxplot(
+      width        = box_width,
+      outlier.shape = NA,
+      linewidth    = 0.6,
+      fill         = "grey90"
+    ) +
+    geom_point(
+      aes(color = if (use_color) .color_group else NULL),
+      position = position_jitter(width = 0.08, height = 0),
+      size     = point_size,
+      alpha    = point_alpha
+    ) +
+    facet_wrap(
+      ~ Phenotype_f,
+      ncol      = ncol,
+      scales    = "free_y",
+      drop      = FALSE,
+      labeller  = as_labeller(strip_labels_expr, label_parsed)
+    ) +
+    scale_y_continuous(
+      breaks       = percent_breaks_pretty5(),
+      labels       = percent_labels_distinct(),
+      minor_breaks = NULL,
+      limits       = function(lims) c(0, lims[2]),
+      expand       = expansion(mult = c(0, top_expand))
+    ) +
+    labs(
+      x        = if (n_groups == 1) NULL else "Group",
+      y        = "Percent of Total Cells",
+      subtitle = subtitle
+    ) +
+    theme_base +
+    theme(
+      strip.placement  = "outside",
+      strip.text       = element_text(size = 8.5, lineheight = 1.05,
+                                      margin = margin(t = 4, r = 6, b = 4, l = 6)),
+      strip.background = element_rect(fill = "white", color = "grey60", linewidth = 0.3),
+      axis.title.x     = element_text(size = 9),
+      axis.title.y     = element_text(size = 9),
+      axis.text.x      = if (n_groups == 1) element_blank() else element_text(size = 9, face = "bold"),
+      axis.ticks.x     = if (n_groups == 1) element_blank() else element_line(),
+      axis.text.y      = element_text(size = 8),
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+      panel.grid.minor = element_blank(),
+      panel.spacing.x  = grid::unit(12, "pt"),
+      panel.spacing.y  = grid::unit(27, "pt"),
+      plot.margin      = margin(t = 16, r = 10, b = 8, l = 8)
+    ) +
+    coord_cartesian(clip = "off")
+
+  if (use_color)
+    p <- p +
+      scale_color_brewer(palette = "Set1", na.value = "grey50", name = NULL) +
+      theme(legend.position = "bottom")
+
+  if (!is.null(pairwise_df) && nrow(pairwise_df) > 0)
+    p <- p + ggpubr::stat_pvalue_manual(
+      data         = pairwise_df,
+      label        = "p.adj.signif",
+      xmin         = "group1",
+      xmax         = "group2",
+      y.position   = "y.position",
+      tip.length   = 0.01,
+      bracket.size = 0.35,
+      hide.ns      = !isTRUE(show_ns),
+      size         = 2.7
+    )
+
+  p
+}
+
+```
+
+## Background and Objectives
+
+<!-- Tailor this section to each specific collaborator and pilot -->
+
+Dr. Brooke Fridley is investigating Ewing sarcoma (EWS), a rare cancer that affects bones and soft tissue in children, teens and young adults. We report an exploratory analysis of the relative abundance of T, B, NK, and myeloid phenotypes.
+
+## Methods
+
+<!-- This section should be consistent across pilots (unless changing methods) -->
+
+Multiplex immunofluorescence images were generated from `r length(unique(spatial_df_final$SampleID))` tissue samples across `r length(unique(spatial_df_final$SubjectID))` patients. Nine samples are derived from primary tumors, while four are from metastatic tumors.
+
+Tissues of interest were adhered to microscope slides with standard histological techniques. The slides were prepared and stained according to the method published in Akoya Biosciences PhenoCycler-Fusion user manual \[1\]. This method involves antigen retrieval, then staining using a panel of Akoya Biosciences manufactured antibodies, before final tissue fixation. Subsequent slide processing occurred on the PhenoCycler-Fusion system where a set of reporters were dispensed onto the tissue so that distinct images could be acquired and compiled using fluorescence microscopy.
+
+Multiplex images were segmented in QuPath using a pre-trained StarDist deep‑learning model to identify individual cells within manually annotated regions corresponding to each sample \[2,3\]. For each marker, expression values were log-transformed and scaled by the per-slide mean intensity to reduce slide-to-slide variation and minimize batch effects.
+
+Cell phenotyping was performed using *GammaGateR*, a computationally efficient Gamma mixture model with the ability to specify priors on the expected modes of the marker-negative and marker-positive distributions \[4\]. For each cell, the model computes the posterior probability of being marker-positive given the measured expression. These probabilities are then used to perform binary phenotype assignment using a Bayesian false discovery rate gating rule. We select the most stringent probability cutoff that controlled expected false positives while keeping the overall positivity rate within prespecified, marker-specific bounds based on known biology and staining characteristics. Multi‑marker phenotypes are then assigned by logical combination of the per‑marker binary calls according to the predefined lineage/subtype rules in the table below.
+
+```{r gating summary}
+
+spatial_df_final %>%
+  filter(!Phenotype %in% c("Other/Unassigned", "Ambiguous/Double+")) %>%
+  count(Lineage, Phenotype) %>%
+  group_by(Lineage) %>%
+  mutate(`% of lineage` = round(n / sum(n) * 100, 2)) %>%
+  ungroup() %>%
+  arrange(Lineage, desc(n)) %>%
+  select(Lineage, Phenotype) %>%
+  gt::gt(groupname_col = "Lineage") %>%
+  gt::tab_caption("Phenotype definitions by lineage") %>%
+  gt::cols_width(
+    Lineage  ~ gt::px(100),
+    Phenotype ~ gt::px(350)
+  ) %>%
+  gt::cols_align(align = "left") %>%
+  gt::tab_options(
+    table.width          = gt::px(460),
+    table.align          = "center",
+    data_row.padding     = gt::px(3),
+    table.font.size      = gt::px(13),
+    row_group.font.weight = "bold"
+  )
+
+```
+
+Any marker combinations not mapped to prespecified phenotypes of primary interest are consolidated into an “Other/Unassigned” category.
+
+Details on the parameters used for segmentation and phenotyping, as well as analysis session info, can be located in the Appendix section.
+
+## Results
+
+### Abundance
+
+Figure 1 summarizes phenotype abundances as a percent of total cells in each sample.
+
+```{r Table1}
+
+make_phenotype_tbl_summary <- function(
+  df,
+  cohort_levels     = NULL,
+  lineage_levels    = NULL,
+  phenotype_levels  = NULL,
+  label_px          = 260,
+  column_px         = 120,
+  font_size_px      = 13,
+  row_padding_px    = 3,
+  summary_padding_px= 2
+) {
+
+  # ----------------------------- Validation -----------------------------------
+  req <- c("SampleID", "Lineage", "Phenotype", "prop_total")
+  missing_cols <- setdiff(req, names(df))
+
+  if (length(missing_cols) > 0) {
+    stop("`df` must contain: ", paste(missing_cols, collapse = ", "))
+  }
+
+  has_cohort <- "Cohort" %in% names(df)
+
+  if (has_cohort) {
+    df <- df %>%
+      mutate(Cohort = as.character(.data$Cohort))
+  
+    observed_cohorts <- unique(df$Cohort[!is.na(df$Cohort) & nzchar(df$Cohort)])
+  
+    if (!is.null(cohort_levels) && length(cohort_levels) > 0) {
+      cohort_levels <- intersect(cohort_levels, observed_cohorts)
+    } else {
+      cohort_levels <- observed_cohorts
+    }
+  
+    if (length(cohort_levels) > 0) {
+      df <- df %>%
+        filter(.data$Cohort %in% cohort_levels) %>%
+        mutate(Cohort = factor(.data$Cohort, levels = cohort_levels))
+    } else {
+      has_cohort <- FALSE
+      df <- df %>% select(-.data$Cohort)
+    }
+  }
+
+  # ----------------------------- Phenotype order ------------------------------
+  present <- df %>%
+    distinct(.data$Lineage, .data$Phenotype)
+
+  if (is.list(phenotype_levels) && length(phenotype_levels) > 0) {
+    lineage_order <- if (!is.null(lineage_levels)) {
+      lineage_levels
+    } else {
+      names(phenotype_levels)
+    }
+
+    phen_order <- phenotype_levels[
+      intersect(lineage_order, names(phenotype_levels))
+    ] %>%
+      unlist(use.names = FALSE) %>%
+      intersect(present$Phenotype)
+  } else {
+    if (!is.null(lineage_levels)) {
+      present <- present %>%
+        mutate(Lineage = factor(.data$Lineage, levels = lineage_levels))
+    }
+
+    phen_order <- present %>%
+      arrange(.data$Lineage, .data$Phenotype) %>%
+      pull(.data$Phenotype)
+  }
+
+  # ----------------------------- Wide table -----------------------------------
+  id_cols <- if (has_cohort) c("SampleID", "Cohort") else "SampleID"
+
+  wide_df <- df %>%
+    select(all_of(id_cols), .data$Phenotype, .data$prop_total) %>%
+    group_by(across(all_of(c(id_cols, "Phenotype")))) %>%
+    summarise(
+      prop_total = mean(.data$prop_total, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = .data$Phenotype,
+      values_from = .data$prop_total
+    ) %>%
+    mutate(across(-all_of(id_cols), ~ as.numeric(.x * 100)))
+
+  selected_phenotypes <- intersect(phen_order, setdiff(names(wide_df), id_cols))
+
+  wide_df <- wide_df %>%
+    select(any_of("Cohort"), all_of(selected_phenotypes))
+
+  # ----------------------------- Summary table --------------------------------
+  tbl_args <- list(
+    data      = wide_df,
+    include   = where(is.numeric),
+    type      = everything() ~ "continuous2",
+    missing   = "no",
+    statistic = all_continuous() ~ c(
+      "{mean} ({sd})",
+      "{median} [{min}, {max}]"
+    ),
+    digits = all_continuous() ~ 2
+  )
+
+  if (has_cohort) {
+    tbl_args$by <- quote(Cohort)
+  }
+
+  tbl <- do.call(gtsummary::tbl_summary, tbl_args) %>%
+    gtsummary::modify_table_body(function(tb) {
+      stat_cols <- grep("^stat_", names(tb), value = TRUE)
+
+      stat_mat <- if (length(stat_cols) > 0) {
+        as.data.frame(tb[stat_cols], stringsAsFactors = FALSE)
+      } else {
+        NULL
+      }
+
+      has_stat <- if (!is.null(stat_mat)) {
+        apply(stat_mat, 1, function(r) any(nzchar(r) & !is.na(r)))
+      } else {
+        rep(FALSE, nrow(tb))
+      }
+
+      is_median <- if (!is.null(stat_mat)) {
+        apply(stat_mat, 1, function(r) any(grepl("\\[", r)))
+      } else {
+        rep(FALSE, nrow(tb))
+      }
+
+      is_mean <- has_stat & !is_median
+
+      if ("row_type" %in% names(tb) && "label" %in% names(tb)) {
+        ix <- tb$row_type == "label" & grepl("\\([^)]*\\+[^)]*\\)", tb$label)
+
+        tb$label[ix] <- sub("\\s*\\(", "<br/>(", tb$label[ix])
+
+        tb$label[is_mean]   <- "Mean (SD)"
+        tb$label[is_median] <- "Median [Min, Max]"
+      }
+
+      if (length(stat_cols) > 0) {
+        for (sc in stat_cols) {
+          z <- tb[[sc]]
+
+          z[!is.na(z) & z == "0.00 (0.00)"] <- "<0.01"
+
+          idx <- !is.na(z) & is_mean & grepl("^0\\.00 \\(", z)
+          if (any(idx)) {
+            z[idx] <- sub("^0\\.00", "<0.01", z[idx])
+          }
+
+          idx <- !is.na(z) & is_median
+          if (any(idx)) {
+            z[idx] <- gsub("\\b0\\.00\\b", "<0.01", z[idx])
+          }
+
+          tb[[sc]] <- z
+        }
+      }
+
+      tb
+    }) %>%
+    gtsummary::modify_header(label ~ "**Phenotype**")
+
+  if (has_cohort) {
+    tbl <- tbl %>%
+      gtsummary::modify_header(gtsummary::all_stat_cols() ~ "**{level} (%)**") %>%
+      gtsummary::modify_caption(
+        "**Table 1:** Summary of mean, standard deviation, median, and range of percent abundance for each immune phenotype across sample cohorts. Values represent cell-type frequencies as a percentage of all segmented cells within each sample."
+      )
+  } else {
+    tbl <- tbl %>%
+      gtsummary::modify_header(gtsummary::all_stat_cols() ~ "**Overall (%)**") %>%
+      gtsummary::modify_caption(
+        "**Table 1:** Summary of mean, standard deviation, median, and range of percent abundance for each immune phenotype across samples. Values represent cell-type frequencies as a percentage of all segmented cells within each sample."
+      )
+  }
+
+  tbl <- tbl %>%
+    gtsummary::bold_labels()
+
+  # ----------------------------- gt formatting --------------------------------
+  gt_tbl <- gtsummary::as_gt(tbl)
+
+  bh <- gt_tbl[["_boxhead"]]
+
+  gt_cols <- if (!is.null(bh) && "var" %in% names(bh)) {
+    unique(bh$var[!is.na(bh$var)])
+  } else {
+    names(gt_tbl[["_data"]])
+  }
+
+  label_col <- intersect("label", gt_cols)
+  num_cols  <- setdiff(gt_cols, "label")
+
+  width_fmls <- list()
+
+  if (length(label_col) == 1) {
+    width_fmls <- c(
+      width_fmls,
+      rlang::new_formula(
+        rlang::sym(label_col),
+        gt::px(as.integer(label_px))
+      )
+    )
+  }
+
+  if (length(num_cols) > 0) {
+    width_fmls <- c(
+      width_fmls,
+      lapply(
+        num_cols,
+        function(col) {
+          rlang::new_formula(
+            rlang::sym(col),
+            gt::px(as.integer(column_px))
+          )
+        }
+      )
+    )
+  }
+
+  if (length(width_fmls) > 0) {
+    gt_tbl <- do.call(gt::cols_width, c(list(gt_tbl), width_fmls))
+  }
+
+  if (length(num_cols) > 0) {
+    gt_tbl <- gt::cols_align(gt_tbl, columns = num_cols, align = "center")
+  }
+
+  if (length(label_col) == 1) {
+    gt_tbl <- gt_tbl %>%
+      gt::cols_align(columns = label_col, align = "left") %>%
+      gt::fmt_markdown(columns = label_col)
+  }
+
+  gt_tbl %>%
+    gt::tab_options(
+      data_row.padding          = gt::px(as.integer(row_padding_px)),
+      summary_row.padding       = gt::px(as.integer(summary_padding_px)),
+      grand_summary_row.padding = gt::px(as.integer(summary_padding_px)),
+      table.font.size           = gt::px(as.integer(font_size_px))
+    )
+}
+
+make_phenotype_tbl_summary(
+  df = abundance_plot_df,
+  phenotype_levels = phenotype_levels, 
+  cohort_levels = NULL,
+  label_px = 300,
+  column_px = 120,
+  font_size_px = 14,
+  row_padding_px = 3,
+  summary_padding_px = 2
+)
+
+```
+
+```{r Boxplots}
+#| results: asis
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-width: 11       # bigger intrinsic figure size (inches)
+#| fig-height: 6
+#| out-width: "100%"   # scale to the tab’s full width
+#| fig-align: center   # center the plot
+#| dpi: 200            # crisper PNGs
+#| fig-retina: 2       # high-DPI displays
+
+# Specify color labels for different SampleID with named vector  (optional)
+
+plots <- setNames(
+  map(names(phenotype_levels), function(lin)
+    plot_lineage(abundance_plot_df, lin,
+                 phenotype_levels  = phenotype_levels,
+                 cohort_levels     = cohort_levels,
+                 ncol              = 3,
+                 add_tests         = FALSE,
+                 statisticallycorrect = FALSE,
+                 subtitle          = NULL,
+                 color_by          = setNames(metadata$Class, metadata$SampleID),
+                 color_by_id_col   = "SampleID")
+  ),
+  names(phenotype_levels)
+)
+
+cat("::: {.panel-tabset}\n\n")  # open the tabset
+
+walk(seq_along(plots), function(i) {
+  nm <- names(plots)[i]
+  cat("### ", nm, "\n\n", sep = "")  # tab heading
+  print(plots[[i]])
+  cat("\n\n")  # important: two newlines to separate tabs
+})
+
+cat(":::\n")  # close the tabset
+
+```
+
+**Figure 1:** Boxplots of percent abundance for each immune cell phenotype out of all cells in the sample. Colored dots indicate primary (blue) or metastatic (red) tumors.
+
+The majority of immune phenotypes across the tissue samples were myeloid cells, followed by NK cells and minimal T or B phenotypes. Among the myeloid cells, the most frequent phenotypes were general macrophages (CD68+), neutrophils (CD66+MPO+), and M-MDSCs (CD11b+CD14+HLA-DR^low^). T cell phenotypes were limited to general T cells (CD3e+), though this may be due to known issues with this marker across pilots.
+
+```{r phenotypeproptable}
+#| fig-width: 11       # bigger intrinsic figure size (inches)
+#| fig-height: 6
+#| out-width: "100%"   # scale to the tab’s full width
+#| 
+
+spatial_df_final %>%
+  filter(!Phenotype %in% c("Other/Unassigned", "Ambiguous/Double+")) %>%
+  count(Lineage, Phenotype) %>%
+  group_by(Lineage) %>%
+  mutate(`% of lineage` = round(n / sum(n) * 100, 2)) %>%
+  ungroup() %>%
+  arrange(Lineage, desc(n)) %>%
+  kbl(caption = "Phenotype composition within each lineage (excluding Other/Unassigned and Ambiguous)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = T) %>%
+  collapse_rows(columns = 1, valign = "top") %>%
+  scroll_box(width = "100%")
+
+```
+
+```{=html}
+<div style="width:100%;"></div>
+```
+```{r stackedbars}
+#| fig-width: 11       # bigger intrinsic figure size (inches)
+#| fig-height: 6
+#| out-width: "100%"   # scale to the tab’s full width
+#| 
+
+.sid_order <- sort(unique(abundance_plot_df$SampleID))
+
+.lineage_levels <- names(phenotype_levels)
+
+.pheno_names <- unlist(phenotype_levels, use.names = F)
+
+.pheno_palette <- setNames(
+  c(
+    colorRampPalette(
+      c(
+        "#E31A1C",  # red
+        "#1F78B4",  # blue
+        "#33A02C",  # green
+        "#FF7F00",  # orange
+        "#6A3D9A",  # purple
+        "#B15928",  # brown
+        "#00CED1",  # dark turquoise
+        "#FF1493",  # deep pink
+        "#FFD700",  # gold
+        "#000080",  # navy
+        "#7FFF00",  # chartreuse
+        "#DC143C",  # crimson
+        "#00FA9A",  # medium spring green
+        "#FF6347",  # tomato
+        "#4B0082",  # indigo
+        "#F0E68C",  # khaki
+        "#8B0000",  # dark red
+        "#00BFFF"   # deep sky blue
+      )
+    )(length(.pheno_names)),
+    "grey80"
+  ),
+  c(.pheno_names, "Other/Unassigned")
+)
+
+p1 <- abundance_plot_df %>%
+  filter(!Lineage %in% c("Other/Unassigned", "Ambiguous/Double+")) %>%
+  mutate(
+    SampleID = factor(SampleID, levels = .sid_order),
+    Lineage  = factor(as.character(Lineage), levels = .lineage_levels)
+  ) %>%
+  group_by(SampleID, Lineage) %>%
+  summarise(pct = sum(prop_total) * 100, .groups = "drop") %>%
+  ggplot(aes(x = SampleID, y = pct, fill = Lineage)) +
+  geom_col(width = 0.75, color = "white", linewidth = 0.3) +
+  scale_fill_brewer(palette = "Set2", name = "Lineage") +
+  scale_x_discrete(limits = .sid_order) +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(title = "Lineage", x = NULL, y = "% of total cells") +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x        = element_text(angle = 45, hjust = 1, size = 8),
+    panel.grid.major.x = element_blank(),
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    legend.position    = "bottom",
+    legend.title       = element_text(face = "bold", size = 9),
+    legend.text        = element_text(size = 10),
+    legend.key.size    = unit(9, "pt")
+  )
+
+p2 <- abundance_plot_df %>%
+  filter(!Phenotype %in% c("Other/Unassigned", "Ambiguous/Double+")) %>%
+  mutate(
+    SampleID  = factor(SampleID, levels = .sid_order),
+    Phenotype = factor(as.character(Phenotype), levels = .pheno_names)
+  ) %>%
+  group_by(SampleID, Phenotype) %>%
+  summarise(pct = sum(prop_total) * 100, .groups = "drop") %>%
+  ggplot(aes(x = SampleID, y = pct, fill = Phenotype)) +
+  geom_col(width = 0.75, color = "white", linewidth = 0.15) +
+  scale_fill_manual(values = .pheno_palette, name = "Phenotype") +
+  scale_x_discrete(limits = .sid_order) +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(title = "Phenotype", x = NULL, y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x        = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y        = element_blank(),
+    axis.ticks.y       = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    legend.position    = "bottom",
+    legend.title       = element_text(face = "bold", size = 9),
+    legend.text        = element_text(size = 8.5),
+    legend.key.size    = unit(8, "pt")
+  ) +
+  guides(fill = guide_legend(nrow = 7, ncol = 2, byrow = TRUE))
+
+p1 + p2 +
+  plot_layout(widths = c(1, 1.8), nrow = 1)
+
+```
+
+**Figure 2:** Stacked bar charts of observed immune cell abundance (%) in relation to the total cell population. Abundances are organized by lineage and individual phenotypes within the lineage.
+
+```{r marker-hierarchy, results='asis', dpi=96}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-width: 11       # bigger intrinsic figure size (inches)
+#| fig-height: 6
+#| out-width: "100%"   # scale to the tab’s full width
+#| 
+.marker_matrix <- spatial_df_final %>%
+  select(all_of(cfg$gammagater$markers)) %>%
+  mutate(across(everything(), as.integer)) %>%
+  as.matrix()
+
+cat("::: {.panel-tabset}\n\n")
+
+for (focal_marker in cfg$gammagater$markers) {
+
+  cat("##", focal_marker, "\n\n")
+
+  other_markers <- setdiff(cfg$gammagater$markers, focal_marker)
+  focal_rows    <- .marker_matrix[, focal_marker] == 1L
+  n_focal       <- sum(focal_rows)
+
+  if (n_focal < 10) {
+    cat("Insufficient", focal_marker, "+ cells for analysis.\n\n")
+    next
+  }
+
+  # ── Build focal matrix ──────────────────────────────────────────────────────
+  focal_mat <- matrix(
+    as.integer(.marker_matrix[focal_rows, other_markers]),
+    nrow = n_focal
+  )
+  colnames(focal_mat) <- other_markers
+
+  # ── Compute intersection counts via bit keys ────────────────────────────────
+  powers      <- 2L ^ (seq_len(length(other_markers)) - 1L)
+  keys        <- as.integer(focal_mat %*% powers)
+  key_counts  <- table(keys)
+  unique_keys <- as.integer(names(key_counts))
+
+  unique_mat           <- outer(unique_keys, powers, FUN = bitwAnd) > 0L
+  colnames(unique_mat) <- other_markers
+
+  combo_strings <- apply(unique_mat, 1, function(row) {
+    pos <- other_markers[as.logical(row)]
+    if (length(pos) == 0L) "None" else paste(sort(pos), collapse = " + ")
+  })
+
+  combo_df <- data.frame(
+    combo = combo_strings[match(as.character(keys),
+                                as.character(unique_keys))],
+    stringsAsFactors = FALSE
+  ) %>%
+    dplyr::count(combo) %>%
+    dplyr::mutate(
+      pct       = round(n / sum(n) * 100, 2),
+      n_markers = if_else(
+        combo == "None", 0L,
+        as.integer(lengths(strsplit(combo, " + ", fixed = TRUE)))
+      )
+    ) %>%
+    # ── Aggregate rare combinations below 0.4% into "Other combinations" ─────
+    dplyr::mutate(
+      combo     = if_else(pct < 0.4, "Other combinations", combo),
+      n_markers = if_else(pct < 0.4, NA_integer_, n_markers)
+    ) %>%
+    dplyr::group_by(combo, n_markers) %>%
+    dplyr::summarise(
+      n   = sum(n),
+      pct = sum(pct),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      label = paste0(combo, "\n", round(pct, 2), "%")
+    ) %>%
+    dplyr::arrange(desc(n))
+
+  # ── Treemap ──────────────────────────────────────────────────────────────────
+  p_treemap <- ggplot(combo_df,
+                      aes(area = n, fill = n_markers, label = label)) +
+    geom_treemap(colour = "black", linewidth = 0.8) +
+    geom_treemap_text(
+      color     = "black",
+      place     = "centre",
+      size      = 9,
+      fontface  = "bold",
+      reflow    = T,
+      padding.x = grid::unit(2, "mm"),
+      padding.y = grid::unit(2, "mm")
+    ) +
+    scale_fill_distiller(
+      palette  = "Blues",
+      direction = 1,
+      name     = "N co-markers",
+      na.value = "grey80"
+    ) +
+    labs(
+      title    = paste0("Co-marker treemap among ", focal_marker, "+ cells"),
+      subtitle = paste0("N = ", format(n_focal, big.mark = ","),
+                        " ", focal_marker, "+ cells. ",
+                        "Combinations <0.4% aggregated into 'Other combinations'.")
+    ) +
+    theme_bw(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"))
+
+  # ── UpSet ─────────────────────────────────────────────────────────────────── 
+  p_upset <- tryCatch({
+    upset_df <- as.data.frame(focal_mat == 1L)
+
+    if (nrow(upset_df) > 50000) {
+      set.seed(42)
+      upset_df <- upset_df[sample(nrow(upset_df), 50000), , drop = FALSE]
+    }
+
+    upset(
+      upset_df,
+      intersect          = other_markers,
+      base_annotations   = list(
+        "Intersection size" = intersection_size(counts = TRUE)
+      ),
+      width_ratio        = 0.2,
+      min_size           = max(1, floor(nrow(upset_df) * 0.005)),
+      sort_sets          = "descending",
+      sort_intersections = "descending"
+    ) +
+      labs(
+        title    = paste0("Co-marker positivity among ",
+                          focal_marker, "+ cells"),
+        subtitle = paste0(
+          "N = ", format(n_focal, big.mark = ","), " total ",
+          focal_marker, "+ cells; UpSet shown on 50,000-cell subsample"
+        )
+      ) +
+      theme_bw(base_size = 11)
+  }, error = function(e) NULL)
+
+  if (!is.null(p_upset))   { print(p_upset);   cat("\n\n") }
+  if (!is.null(p_treemap)) { print(p_treemap); cat("\n\n") }
+  
+}
+
+cat(":::\n")
+
+```
+
+**Figure 3:** UpSet plot and treemap of most prevalent phenotypes when a cell is positive for a given marker. Phenotypes with \<0.4% prevalence are aggregated into an "Other combinations" category.
+
+### Spatial Visualization
+
+```{r}
+#| results: asis
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+#| dpi: 400
+#| fig-align: center
+
+plot_spatial_tabs_html <- function(
+  df,
+  out_dir           = "spatial_tab_imgs",
+  fg_point_size     = 0.70,
+  bg_point_size     = 0.25,
+  alpha_fg          = 0.60,
+  alpha_bg          = 0.35,
+  flip_y            = FALSE,
+  legend_text_size  = 14,
+  legend_wrap_width = 16,
+  legend_max_rows   = 3,
+  legend_dot_size   = 5,
+  fig_width         = 20,
+  fig_height        = 14,
+  dpi               = 200,
+  group_col         = NULL,
+  color_palette     = NULL
+) {
+
+  # ── Validation ───────────────────────────────────────────────────────────────
+  stopifnot(all(c("SampleID", "X", "Y", "Phenotype") %in% names(df)))
+  df$X <- as.numeric(df$X)
+  df$Y <- as.numeric(df$Y)
+
+  other_name <- "Other/Unassigned"
+  df$Phenotype[df$Phenotype == "" | is.na(df$Phenotype)] <- other_name
+
+  # ── Helpers ──────────────────────────────────────────────────────────────────
+  wrap_labels <- function(x, width)
+    vapply(x, function(s)
+      paste(strwrap(as.character(s), width = width), collapse = "\n"),
+      "", USE.NAMES = FALSE)
+
+  idify <- function(x) gsub("[^A-Za-z0-9_-]+", "-", x)
+  fwdsl <- function(p) gsub("\\\\", "/", p)
+
+  # ── Output directory ─────────────────────────────────────────────────────────
+  out_dir <- fwdsl(normalizePath(out_dir, mustWork = FALSE))
+  if (!dir.exists(out_dir))
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # ── Global levels and palette ────────────────────────────────────────────────
+  rest_global <- sort(unique(df$Phenotype[df$Phenotype != other_name]))
+  global_levs <- c(other_name, rest_global)
+
+  if (!is.null(color_palette)) {
+    # Use supplied palette — reorder to match global_levs, fill any gaps
+    cols_global <- color_palette
+    cols_global[other_name] <- "grey80"
+    global_levs <- c(
+      other_name,
+      names(color_palette)[names(color_palette) != "other_name"]
+    )
+    global_levs <- unique(global_levs)
+  } else {
+    rest_global <- sort(unique(df$Phenotype[df$Phenotype != other_name]))
+    global_levs <- c(other_name, rest_global)
+  }
+
+  # ── Tab skeleton ─────────────────────────────────────────────────────────────
+  sids       <- sort(unique(df$SampleID))
+  tab_prefix <- paste0("sv-", as.integer(as.numeric(Sys.time())))
+
+  cat(sprintf(
+    '<ul class="nav nav-tabs" id="%s-tablist" role="tablist">\n',
+    tab_prefix
+  ))
+  for (i in seq_along(sids)) {
+    sid        <- sids[i]
+    tab_id     <- paste0(tab_prefix, "-tab-",  i)
+    pane_id    <- paste0(tab_prefix, "-pane-", i)
+    active_cls <- if (i == 1) " active" else ""
+    aria_sel   <- if (i == 1) "true" else "false"
+    cat(sprintf(
+      '<li class="nav-item" role="presentation"><button class="nav-link%s" id="%s" data-bs-toggle="tab" data-bs-target="#%s" type="button" role="tab" aria-controls="%s" aria-selected="%s">%s</button></li>\n',
+      active_cls, tab_id, pane_id, pane_id, aria_sel, sid
+    ))
+  }
+  cat("</ul>\n")
+
+  # ── Render each sample ───────────────────────────────────────────────────────
+  cat(sprintf(
+    '<div class="tab-content" id="%s-content" style="margin-top:10px;">\n',
+    tab_prefix
+  ))
+
+  for (i in seq_along(sids)) {
+    sid         <- sids[i]
+    pane_id     <- paste0(tab_prefix, "-pane-", i)
+    tab_id      <- paste0(tab_prefix, "-tab-",  i)
+    show_active <- if (i == 1) " show active" else ""
+
+    d           <- df[df$SampleID == sid, , drop = FALSE]
+    d$Phenotype <- factor(d$Phenotype, levels = global_levs)
+
+    present     <- intersect(global_levs, unique(as.character(d$Phenotype)))
+    lab_wrapped <- wrap_labels(present, legend_wrap_width)
+
+    rows <- max(1, min(legend_max_rows,
+                       ceiling(length(present) /
+                               max(1, floor(fig_width /
+                                            (legend_wrap_width * 0.6))))))
+
+    d_bg <- d[as.character(d$Phenotype) == other_name, , drop = FALSE]
+    d_fg <- d[as.character(d$Phenotype) != other_name, , drop = FALSE]
+
+    # Title (SampleID & cell count)
+    title_label <- {
+      n_cells <- sum(is.finite(d$X) & is.finite(d$Y))
+      if (!is.null(group_col) && group_col %in% names(d)) {
+        grp <- unique(d[[group_col]])
+        grp <- grp[!is.na(grp)]
+        paste0(sid, " (", paste(grp, collapse = "/"), ") | N = ",
+               format(n_cells, big.mark = ","))
+      } else {
+        paste0(sid, " - N = ", format(n_cells, big.mark = ","))
+      }
+    }
+
+    p <- ggplot() +
+      { if (nrow(d_bg) > 0)
+          geom_scattermore(data = d_bg,
+                     aes(X, Y, color = Phenotype),
+                     alpha = alpha_bg, size = bg_point_size, shape = 16) } +
+      { if (nrow(d_fg) > 0)
+          geom_scattermore(data = d_fg,
+                     aes(X, Y, color = Phenotype),
+                     alpha = alpha_fg, size = fg_point_size, shape = 16) } +
+      coord_equal() +
+      { if (flip_y) scale_y_reverse() } +
+      scale_color_manual(
+        values = cols_global,
+        breaks = present,
+        labels = lab_wrapped,
+        drop   = FALSE
+      ) +
+      labs(title = title_label) +
+      theme_void(base_size = 13) +
+      theme(
+        plot.title       = element_text(size = 14, face = "bold",
+                                        hjust = 0.5,
+                                        margin = margin(b = 8)),
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        legend.box       = "horizontal",
+        legend.text      = element_text(size = legend_text_size),
+        legend.title     = element_blank(),
+        legend.margin    = margin(2, 2, 2, 2),
+        legend.spacing.y = unit(6, "pt"),
+        legend.spacing.x = unit(8, "pt")
+      ) +
+      guides(color = guide_legend(
+        title        = NULL,
+        nrow         = rows,
+        byrow        = TRUE,
+        override.aes = list(size = legend_dot_size, alpha = 1)
+      ))
+
+    fname <- paste0("spatial_", idify(sid), ".png")
+    fpath <- fwdsl(file.path(out_dir, fname))
+    ggsave(fpath, plot = p,
+           width = fig_width, height = fig_height,
+           dpi = dpi, limitsize = FALSE)
+
+    img_tag <- sprintf(
+      '<img src="%s" style="width:100%%; height:80vh; object-fit:contain; display:block; margin:0 auto;" />',
+      fpath
+    )
+    cat(sprintf(
+      '<div class="tab-pane fade%s" id="%s" role="tabpanel" aria-labelledby="%s">\n  %s\n</div>\n',
+      show_active, pane_id, tab_id, img_tag
+    ))
+  }
+
+  cat("</div>\n")
+  invisible(NULL)
+}
+
+```
+
+```{r spatial}
+#| results: asis
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+#| out-width: "100%"
+#| fig-align: center
+
+plot_spatial_tabs_html(
+  df = spatial_df_final %>% filter(Phenotype != "Ambiguous/Double+"),
+  flip_y = TRUE,
+  fg_point_size = 1.4, # Lower if dots forming pixel structure or obscuring each other, raise if lots of cells 
+  bg_point_size = 0.2,
+  alpha_fg = 0.80,
+  alpha_bg = 0.2,        
+  legend_text_size = 12,   
+  legend_wrap_width = 9,
+  legend_max_rows = 3,
+  fig_width = 10,
+  fig_height = 8,
+  dpi = 300,
+  color_palette = .pheno_palette
+)
+
+```
+
+## Conclusions
+
+Based on the data, we can make the following preliminary conclusions:
+
+1.  No visible differences between primary and metastatic tumors.
+
+2.  Myeloids were the most abundant lineage, with general macrophages (CD68+), neutrophils (CD66+MPO+), and M-MDSCs (CD11b+CD14+HLA-DR^low^) as the most common myeloid phenotypes.
+
+3.  Several samples had \~3-5% NK cell composition, with even lower T cell and B cell abundance across all samples.
+
+### Algorithm Parameters
+
+To ensure reproducibility of the processing workflow, click "Show the code" to view the scripts and/or their corresponding parametrizations for obtaining segmentation and phenotyping results.
+
+```{r}
+
+# Segmentation: Stardist
+
+# def pLow = 2; def pHigh = 98   
+# def threshold = 0.6            
+# def pixelSize = 0.7            
+# def cellExpand = 3             
+
+# Phenotyping: GammaGateR
+
+# boundaries_IO60 <- list(
+#   `b-Catenin1`        = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `Bcl-2`             = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `Beta-actin`        = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   Caveolin            = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD107a              = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD11b               = matrix(c(0, 0.45, 0.50, 1), byrow = TRUE, nrow = 2),
+#   CD11c               = matrix(c(0, 0.25, 0.35, Inf), byrow = TRUE, nrow = 2),
+#   CD14                = matrix(c(0, 0.2, 0.30, 1), byrow = TRUE, nrow = 2),
+#   CD163               = matrix(c(0, 0.275, 0.3, Inf), byrow = TRUE, nrow = 2),
+#   CD20                = matrix(c(0, 0.55, 0.675, Inf), byrow = TRUE, nrow = 2),
+#   CD206               = matrix(c(0, 0.275, 0.4, Inf), byrow = TRUE, nrow = 2),
+#   CD209               = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD21                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD31                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD34                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD38                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD39                = matrix(c(0, 0.075, 0.1, Inf), byrow = TRUE, nrow = 2),
+#   CD3e                = matrix(c(0, 0.3, 0.4, Inf), byrow = TRUE, nrow = 2),
+#   CD4                 = matrix(c(0, 0.35, 0.4, Inf), byrow = TRUE, nrow = 2),
+#   CD44                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD45                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD45RO              = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD56                = matrix(c(0, 0.325, 0.45, Inf), byrow = TRUE, nrow = 2),
+#   CD57                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD66                = matrix(c(0, 0.35, 0.45, Inf), byrow = TRUE, nrow = 2),
+#   CD68                = matrix(c(0, 0.2, 0.25, Inf), byrow = TRUE, nrow = 2),
+#   CD79a               = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   CD8                 = matrix(c(0, 0.275, 0.3, Inf), byrow = TRUE, nrow = 2),
+#   `Collagen IV`       = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   DAPI                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `E-cadherin`        = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   EpCAM               = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   ER                  = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   FOXP3               = matrix(c(0, 0.3, 0.40, Inf), byrow = TRUE, nrow = 2),
+#   GP100               = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `Granzyme B`        = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `Histone H3 (p Ser28)` = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `HLA-A`             = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `HLA-DR`            = matrix(c(0, 0.25, 0.30, Inf), byrow = TRUE, nrow = 2),
+#   ICOS                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   IDO1                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   IFNG                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   iNOS                = matrix(c(0, 0.3, 0.375, Inf), byrow = TRUE, nrow = 2),
+#   `Keratin 14`        = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `Keratin 5`         = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `Keratin 8/18`      = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   Ki67                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   LAG3                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   MPO                 = matrix(c(0, 0.25, 0.325, Inf), byrow = TRUE, nrow = 2),
+#   `Pan-Cytokeratin`   = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   PCNA                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `PD-1`              = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `PD-L1`             = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   Podoplanin          = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   SMA                 = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   SOX2                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   `TCF-1`             = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   TOX                 = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   TP63                = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   Vimentin            = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2),
+#   VISTA               = matrix(c(0, 0.25, 0.50, Inf), byrow = TRUE, nrow = 2)
+# )
+
+# Phenotyping: FDR Classification
+
+# marker_fdr <- c(
+#   CD3e     = 0.10, CD4   = 0.20, CD8   = 0.20, FOXP3 = 0.20, CD39  = 0.20,
+#   CD56     = 0.05, CD20  = 0.15,
+#   CD66     = 0.10, MPO   = 0.10,
+#   CD68     = 0.05, CD163 = 0.10, CD206 = 0.10, iNOS  = 0.10,
+#   CD11b    = 0.10, CD14  = 0.10, CD11c = 0.10,
+#   `HLA-DR` = 0.10
+# )
+# 
+# marker_min_pos <- setNames(rep(0.001, length(marker_fdr)), names(marker_fdr))
+# 
+# marker_max_cap <- c(
+#   CD3e     = 0.05, CD4   = 0.05, CD8   = 0.05, FOXP3 = 0.05, CD39  = 0.05,
+#   CD56     = 0.05, CD20  = 0.08,
+#   CD66     = 0.15, MPO   = 0.15,
+#   CD68     = 0.20, CD163 = 0.25, CD206 = 0.25, iNOS  = 0.20,
+#   CD11b    = 0.40, CD14  = 0.30, CD11c = 0.20,
+#   `HLA-DR` = 0.50
+# )
+
+```
+
+### Session Info
+
+```{r}
+
+devtools::session_info()
+
+```
+
+### References
+
+1.  Akoya Biosciences, Inc. (2023). *PhenoCycler‑Fusion user guide* (Doc. No. PD‑000011, Rev. K). https://content.protocols.io/files/nur5b8i4p.pdf
+
+2.  Bankhead, P., Loughrey, M. B., Fernández, J. A., Dombrowski, Y., McArt, D. G., Dunne, P. D., McQuaid, S., Gray, R. T., Murray, L. J., Coleman, H. G., James, J. A., Salto-Tellez, M., & Hamilton, P. W. (2017). QuPath: Open source software for digital pathology image analysis. *Scientific Reports*, *7*(1). https://doi.org/10.1038/s41598-017-17204-5
+
+3.  Schmidt, U., Weigert, M., Broaddus, C., & Myers, G. (2018). Cell Detection with Star-convex Polygons. *ArXiv:1806.03535 \[Cs\]*, *11071*, 265–273. https://doi.org/10.1007/978-3-030-00934-2_30
+
+4.  Xiong, J., Kaur, H., Heiser, C. N., McKinley, E. T., Roland, J. T., Coffey, R. J., Shrubsole, M. J., Wrobel, J., Ma, S., Lau, K. S., & Vandekar, S. (2024). GammaGateR: semi-automated marker gating for single-cell multiplexed imaging. *Bioinformatics*, *40*(6). https://doi.org/10.1093/bioinformatics/btae356

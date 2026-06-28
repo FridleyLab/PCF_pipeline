@@ -1,0 +1,635 @@
+---
+title: "GammaGateR Model Diagnostics"
+subtitle: "`r paste('Run:', params$run_id)`"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: hide
+    self_contained: true
+params:
+  run_id: "fit1"
+  ggr_base: "results/GammaGateR"
+---
+
+```{r setup, include=FALSE}
+
+.libPaths("/mnt/project/blfridley/PCF_pilots/_common/R/renv/library/linux-rhel-8.10/R-4.4/x86_64-pc-linux-gnu")
+options(gt.markdown_engine = "markdown")
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+  library(purrr)
+  library(GammaGateR)
+  library(knitr)
+  library(kableExtra)
+  library(bslib)
+  library(tools)
+  library(viridis)
+  library(ggplot2)
+  library(patchwork)
+  library(tibble)
+})
+
+knitr::opts_chunk$set(
+  echo       = FALSE,
+  message    = FALSE,
+  warning    = FALSE,
+  comment    = NA,
+  dev        = "png",
+  fig.width  = 12,
+  fig.height = 6
+)
+options(bitmapType = "cairo")
+
+run_id      <- params$run_id
+ggr_dir     <- file.path(params$ggr_base, run_id)
+results_dir <- dirname(params$ggr_base)
+
+if (!dir.exists(ggr_dir)) stop("Run folder not found: ", ggr_dir)
+
+rds_files <- sort(list.files(ggr_dir, pattern = "\\.rds$", full.names = TRUE))
+rds_files <- rds_files[!grepl("boundar", basename(rds_files), ignore.case = TRUE)]
+if (!length(rds_files)) stop("No fit .rds files found in: ", ggr_dir)
+
+fits <- setNames(
+  lapply(rds_files, readRDS),
+  file_path_sans_ext(basename(rds_files))
+)
+fits <- lapply(fits, function(x) if (is.list(x) && length(x) == 1L) x[[1]] else x)
+class(fits) <- "groupGammaGateR"
+
+nzNormedMarkers <- colnames(fits[[1]]$expressionZ)
+markers_clean   <- sub("^nzNorm_", "", nzNormedMarkers)
+sample_ids      <- names(fits)
+
+data_processed <- fread(
+  file.path(results_dir, "data_processed.csv")
+) %>% as_tibble()
+
+left_cols <- c("ImageID", "SubjectID", "X", "Y")
+
+exprZ_all <- map_dfr(rds_files, function(f) {
+  fit <- readRDS(f)
+  if (is.list(fit) && length(fit) == 1L) fit <- fit[[1L]]
+  if (is.null(fit$expressionZ))
+    stop("Missing `expressionZ` in: ", basename(f))
+  as.data.frame(fit$expressionZ) %>%
+    as_tibble() %>%
+    mutate(
+      SampleID  = file_path_sans_ext(basename(f)),
+      CellIndex = row_number()
+    )
+})
+
+metadata_by_cell <- data_processed %>%
+  mutate(
+    SampleID_join = as.character(SampleID),
+    CellIndex     = ave(seq_len(n()), SampleID_join, FUN = seq_along)
+  ) %>%
+  select(SampleID_join, CellIndex, any_of(left_cols))
+
+df_base <- exprZ_all %>%
+  left_join(metadata_by_cell,
+            by = c("SampleID" = "SampleID_join", "CellIndex" = "CellIndex"))
+
+n_missing <- sum(is.na(df_base$ImageID))
+if (n_missing > 0)
+  stop("Metadata join failed for ", n_missing, " rows.")
+
+df_base <- df_base %>%
+  select(-CellIndex) %>%
+  rename_with(~ gsub("^nzNorm_", "", .x), starts_with("nzNorm_")) %>%
+  relocate(any_of(c("ImageID", "SampleID", "SubjectID", "X", "Y")), .before = 1)
+
+```
+
+# Overview
+
+This report evaluates the GammaGateR mixture model fit for run **`r run_id`** across **`r length(sample_ids)`** samples and **`r length(markers_clean)`** markers. The goal is to determine whether the model has learned a meaningful separation between marker-positive and marker-negative cell populations **before any gating threshold is applied**.
+
+Sections are ordered from coarse to fine: convergence first, then parameter-level plausibility, then cell-level posterior diagnostics. Do not proceed to gating parameter specification until you have reviewed Sections 4 and 5. Markers flagged in those sections require adjusted `fdr`, `min_pos_rate`, or `max_pos_rate_cap` settings before binary calls will be reliable.
+
+We want to inspect the fit of each Gamma mixture model to ensure:
+
+-   The parameter estimation converged under the specified bounds
+
+-   The mixture distributions look reasonable and do not overlap substantially
+
+-   The proportion of marker-positive cells is biologically plausible under the specified mode constraints
+
+```{r overview-table}
+tibble(
+  Metric = c("Run ID", "Samples (n)", "Markers (n)", "Total cells"),
+  Value  = c(
+    run_id,
+    as.character(length(sample_ids)),
+    as.character(length(markers_clean)),
+    format(nrow(df_base), big.mark = ",")
+  )
+) %>%
+  kbl(align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  column_spec(1, bold = TRUE)
+```
+
+---
+
+# 1. Model Convergence
+
+The GammaGateR EM algorithm fits a two-component gamma mixture per marker per sample. Convergence failure means the algorithm did not reach a stable parameter solution within the iteration limit. Common causes are: the marker is nearly absent in that sample, the mode constraint bounds are misspecified, or the intensity distribution is degenerate.
+
+Inspect the density histograms and posterior distribution for any non-converged marker x sample combinations in Sections 3 and 4, as well as the normalized expression density curves in the segmentation QC document, in order to assess how to refit. By default, posterior probabilities for non-converged markers are set to NA in that sample. 
+
+```{r convergence-table}
+conv_tbl <- tibble(
+  SampleID = names(fits),
+  Failed   = vapply(seq_along(fits), function(i) {
+    msg <- capture.output(res <- convCheck(fits[[i]]))
+    if (length(msg)) {
+      txt <- paste(msg, collapse = "; ")
+      txt <- gsub('^\\[1\\]\\s*', '', txt)
+      txt <- gsub('[\u201c\u201d"]', '', txt)
+      return(txt)
+    }
+    if (is.logical(res)) {
+      bad <- names(res)[!res]
+      if (length(bad) == 0L) "None" else paste(bad, collapse = ", ")
+    } else "Unknown"
+  }, character(1))
+) %>%
+  mutate(Converged = if_else(Failed %in% c("None", "All converged"), "Yes", "No"))
+
+n_failed <- sum(conv_tbl$Converged == "No")
+
+conv_tbl %>%
+  select(SampleID, Converged, `Failed Channels` = Failed) %>%
+  kbl(
+    align   = c("l", "c", "l"),
+    caption = paste0(n_failed, " of ", nrow(conv_tbl),
+                     " sample(s) have at least one non-converged marker channel")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  column_spec(2,
+              bold  = TRUE,
+              color = if_else(conv_tbl$Converged == "Yes", "#2ca02c", "#d62728")) %>%
+  scroll_box(width = "100%", height = "400px")
+```
+
+---
+
+# 2. Mode vs. Proportion Diagnostics
+
+Each tab shows, for one marker, the estimated **mode** of the positive component and the estimated **proportion of positive cells** (λ) across all samples. Each point is one sample.
+
+**What good looks like:** Points cluster with moderate spread. λ values fall within a biologically plausible range — typically 1–15% for most immune markers in solid tumors, but can be higher for markers like CD11b or HLA-DR. You do not need to keep λ values in the aforementioned range, and can parametrize the model to make this higher or lower based on desired results.
+
+**Red flags:**
+
+- A sample sitting far from the cluster on either axis warrants inspection in Section 3.
+- λ near 0 means almost no positive cells were found; near the `max_pos_rate_cap` ceiling suggests the positive component may be absorbing bulk negative cells.
+- High cross-sample variance in mode for a single marker suggests batch effects in staining intensity.
+
+```{r modeplot, results='asis'}
+tabs <- lapply(seq_along(nzNormedMarkers), function(i) {
+  mk <- nzNormedMarkers[[i]]
+  w  <- tryCatch({
+    x <- plot(fits,
+              marker      = mk,
+              diagnostic  = TRUE,
+              interactive = TRUE,
+              histogram   = FALSE,
+              print       = FALSE)[[1]]
+    if (is.list(x) && length(x) == 1 && inherits(x[[1]], "htmlwidget")) x[[1]] else x
+  }, error = function(e) NULL)
+  if (is.null(w)) return(NULL)
+  bslib::nav_panel(title = markers_clean[i], value = paste0("mk", i), w)
+})
+
+tabs <- Filter(Negate(is.null), tabs)
+do.call(bslib::navset_tab, unname(tabs))
+```
+
+---
+
+# 3. Mixture Density Histograms
+
+For each marker × sample, the observed intensity histogram is overlaid with the two fitted gamma mixture components. The left component represents marker-negative cells; the right represents marker-positive cells.
+
+**What good looks like:** The mixture envelope closely traces the histogram. The two components have clearly separated modes with a visible valley between them.
+
+**Red flags:**
+
+- Both components occupying nearly the same intensity range — posterior probabilities will be unreliable for this marker × sample.
+- The positive component capturing what is visually the negative bulk — the mode constraint upper bound may be too permissive.
+- A flat or near-zero histogram with a fitted positive component — the marker may be genuinely unexpressed in that sample.
+
+```{r density-hists, results='asis'}
+as_group1 <- function(x, slide_name) {
+  if (inherits(x, "groupGammaGateR")) return(x)
+  g <- setNames(list(x), slide_name)
+  class(g) <- "groupGammaGateR"
+  g
+}
+
+cat("## {.tabset}\n\n")
+
+for (i in seq_along(nzNormedMarkers)) {
+  mk     <- nzNormedMarkers[i]
+  mk_lab <- markers_clean[i]
+  cat("### ", mk_lab, " {.tabset}\n\n", sep = "")
+
+  for (sid in names(fits)) {
+    cat("#### ", sid, "\n\n", sep = "")
+    GGfit <- as_group1(fits[[sid]], slide_name = sid)
+    sl    <- names(GGfit)[1]
+
+    out <- tryCatch(
+      plot(GGfit, marker = mk, slide = sl,
+           diagnostic = FALSE, interactive = FALSE,
+           histogram = TRUE, tabl = TRUE, print = FALSE),
+      error = function(e) {
+        cat("**Plot failed:** ", e$message, "\n\n", sep = "")
+        NULL
+      }
+    )
+    if (!is.null(out) && length(out) >= 1) print(out[[1]])
+    cat("\n\n")
+  }
+}
+```
+
+---
+
+# 4. Posterior Probability Distributions
+
+The posterior probability p_i = P(cell i is marker-positive | observed intensity) is the direct output of the Bayesian mixture model. These distributions are the most important pre-gating diagnostic: they reveal how confidently the model separates positive from negative cells for each marker across the full cohort.
+
+**What good looks like:** A strongly U-shaped distribution — dense mass near 0 (confidently negative) and near 1 (confidently positive), with minimal mass in the 0.2–0.8 range. The dashed line at 0.5 is shown for reference only and carries no biological meaning at this stage.
+
+**Red flags:**
+
+- A unimodal distribution centered in the 0.3–0.6 range means the model cannot confidently classify most cells. Any threshold applied to this marker will be largely arbitrary.
+- All mass near 0 with negligible tail near 1 — the positive component may have collapsed.
+- Pronounced between-sample shape differences not explained by known biology — consider batch as a confounder.
+
+```{r posterior-violins, fig.height=8}
+
+set.seed(42)
+
+df_base %>%
+  slice_sample(n = min(50000, nrow(df_base))) %>%
+  pivot_longer(
+    cols      = all_of(markers_clean),
+    names_to  = "marker",
+    values_to = "posterior"
+  ) %>%
+  filter(is.finite(posterior)) %>%
+  ggplot(aes(x = SampleID, y = posterior, fill = SampleID)) +
+  geom_violin(trim = FALSE, scale = "width", linewidth = 0.3, alpha = 0.85) +
+  geom_hline(yintercept = 0.5, linetype = "dashed",
+             color = "#d62728", linewidth = 0.4) +
+  facet_wrap(~ marker, ncol = 4) +
+  scale_fill_viridis_d(option = "turbo", guide = "none") +
+  scale_y_continuous(breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  labs(
+    title    = "Posterior probability distributions by marker and sample",
+    subtitle = "Dashed line at 0.5 for reference only. Plotted on 50,000-cell random subsample.",
+    x        = NULL,
+    y        = "P(positive | data)"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x   = element_text(angle = 50, hjust = 1, size = 7),
+    strip.text    = element_text(face = "bold", size = 9),
+    panel.spacing = unit(8, "pt"),
+    plot.title    = element_text(face = "bold")
+  ) 
+
+```
+
+---
+
+# 5. Bimodality and Separation
+
+## 5a. Confidence Index
+
+The **confidence index** is the fraction of cells with posterior probability < 0.1 (confidently negative) plus the fraction > 0.9 (confidently positive). Values near 1 indicate clean separation. Values below 0.70 indicate that a large fraction of cells sit in an uncertain zone — gating results for that marker × sample will be sensitive to threshold choice.
+
+The heatmap below is a fast-scan summary across all marker × sample combinations. ⚠ flags any combination below 0.70.
+
+```{r confidence-compute}
+
+conf_tbl <- map_dfr(markers_clean, function(m) {
+  p <- df_base[[m]]
+  p <- p[is.finite(p)]
+  df_base %>%
+    select(SampleID, all_of(m)) %>%
+    rename(p = all_of(m)) %>%
+    filter(is.finite(p)) %>%
+    group_by(SampleID) %>%
+    summarise(
+      marker         = m,
+      n_cells        = n(),
+      frac_conf_neg  = mean(p < 0.1),
+      frac_conf_pos  = mean(p > 0.9),
+      conf_index     = frac_conf_neg + frac_conf_pos,
+      frac_uncertain = mean(p >= 0.2 & p <= 0.8),
+      median_entropy = median(-p * log(p + 1e-12) -
+                              (1 - p) * log(1 - p + 1e-12)),
+      .groups        = "drop"
+    )
+})
+
+```
+
+```{r confidence-heatmap, fig.height=6}
+
+conf_tbl %>%
+  ggplot(aes(x = SampleID, y = marker, fill = conf_index)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = if_else(conf_index < 0.70, "\u26a0", "")), size = 3) +
+  scale_fill_viridis_c(option = "magma", direction = -1,
+                       limits = c(0, 1), name = "Confidence\nindex") +
+  labs(
+    title    = "Posterior confidence index by marker and sample",
+    subtitle = "\u26a0 = index below 0.70; gating will be threshold-sensitive for flagged combinations",
+    x        = "Sample",
+    y        = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x  = element_text(angle = 50, hjust = 1, size = 8),
+    panel.grid   = element_blank(),
+    plot.title   = element_text(face = "bold")
+  )
+
+```
+
+```{r confidence-table}
+
+conf_summary <- conf_tbl %>%
+  group_by(marker) %>%
+  summarise(
+    `Mean confidence` = round(mean(conf_index), 3),
+    `SD`              = round(sd(conf_index), 3),
+    `Min`             = round(min(conf_index), 3),
+    `N below 0.70`    = sum(conf_index < 0.70),
+    `Mean uncertain %` = round(mean(frac_uncertain) * 100, 1),
+    `Median entropy`  = round(mean(median_entropy), 4),
+    .groups           = "drop"
+  ) %>%
+  arrange(`Mean confidence`)
+
+conf_summary %>%
+  kbl(caption = "Confidence index summary per marker across samples") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(2,
+              bold  = TRUE,
+              color = if_else(conf_summary$`Mean confidence` < 0.70,
+                              "#d62728", "black")) %>%
+  scroll_box(width = "100%")
+
+```
+
+---
+
+## 5b. Posterior Entropy
+
+Binary entropy H(p) = -p·log(p) - (1-p)·log(1-p) reaches its maximum of log(2) ≈ 0.693 when p = 0.5 (complete uncertainty) and approaches 0 when p is near 0 or 1 (confident classification). This is a more sensitive measure than the confidence index because it quantifies the *degree* of uncertainty, not just its prevalence.
+
+**What good looks like:** A bimodal entropy distribution with peaks near 0 — most cells are confidently assigned to one class.
+
+**Red flags:** High median entropy or a unimodal distribution centered above 0.4 means the model is systematically uncertain across the cell population.
+
+```{r entropy-plot, fig.height=8}
+
+entropy_plot_data <- map_dfr(markers_clean, function(m) {
+  p_vals <- df_base[[m]]
+  p_vals <- p_vals[is.finite(p_vals)]
+  sids   <- df_base$SampleID[is.finite(df_base[[m]])]
+  
+  n_sample <- min(20000, length(p_vals))
+  idx      <- sample(length(p_vals), n_sample)
+  
+  tibble(
+    SampleID = sids[idx],
+    marker   = m,
+    p        = p_vals[idx]
+  ) %>%
+    mutate(
+      entropy = -p * log(p + 1e-12) - (1 - p) * log(1 - p + 1e-12)
+    ) %>%
+    select(SampleID, marker, entropy)
+})
+
+entropy_plot_data %>%
+  ggplot(aes(x = entropy, fill = SampleID)) +
+  geom_density(alpha = 0.45, linewidth = 0.3) +
+  facet_wrap(~ marker, ncol = 4, scales = "free_y") +
+  scale_fill_viridis_d(option = "turbo", name = "Sample") +
+  scale_x_continuous(
+    limits = c(0, log(2) + 0.01),
+    breaks = c(0, 0.2, 0.4, 0.6, log(2)),
+    labels = c("0", "0.2", "0.4", "0.6", "max")
+  ) +
+  labs(
+    title    = "Per-cell posterior entropy distributions by marker and sample",
+    subtitle = "Entropy = 0: certain. Entropy = log(2) \u2248 0.693: maximum uncertainty. 20k-cell subsample per marker.",
+    x        = "Entropy H(p)",
+    y        = "Density"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x     = element_text(size = 7),
+    strip.text      = element_text(face = "bold", size = 9),
+    panel.spacing   = unit(8, "pt"),
+    plot.title      = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+rm(entropy_plot_data)
+invisible(gc())
+
+```
+
+---
+
+## 5c. Positive Rate Summary
+
+The table below summarises, per marker, the fraction of cells with posterior probability > 0.5 — a rough pre-threshold prevalence estimate. High coefficient of variation (CV) across samples suggests either genuine biological heterogeneity or batch effects in staining, both of which affect how per-sample abundance estimates should be interpreted downstream.
+
+```{r posrate-table}
+
+df_base %>%
+  pivot_longer(cols = all_of(markers_clean), names_to = "marker", values_to = "p") %>%
+  filter(is.finite(p)) %>%
+  group_by(SampleID, marker) %>%
+  summarise(pos_rate = mean(p > 0.5), .groups = "drop") %>%
+  group_by(marker) %>%
+  summarise(
+    `Mean pos rate (%)` = round(mean(pos_rate) * 100, 2),
+    `SD (%)`            = round(sd(pos_rate) * 100, 2),
+    `Min (%)`           = round(min(pos_rate) * 100, 2),
+    `Max (%)`           = round(max(pos_rate) * 100, 2),
+    `CV`                = round(sd(pos_rate) / (mean(pos_rate) + 1e-9), 3),
+    .groups             = "drop"
+  ) %>%
+  arrange(desc(CV)) %>%
+  kbl(caption = paste0(
+    "Fraction of cells with posterior > 0.5 per marker (pre-threshold estimate). ",
+    "High CV indicates cross-sample heterogeneity."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  scroll_box(width = "100%")
+
+```
+
+---
+
+# 6. Cross-Marker Posterior Correlation
+
+This heatmap shows the Spearman correlation between posterior probabilities across all marker pairs, computed at the cell level. Biologically related markers should show moderate positive correlation (e.g. CD163 and CD206). Biologically independent markers (e.g. CD3e and CD66) should show correlations near zero.
+
+**Red flags:** High correlation (|r| > 0.4) between markers that should be biologically independent suggests a technical artifact — autofluorescence, spectral spillover, or segmentation error bleeding signal between channels. These artifacts propagate into every downstream phenotype call involving those markers.
+
+```{r correlation-compute}
+
+cor_mat <- df_base %>%
+  select(all_of(markers_clean)) %>%
+  cor(method = "spearman", use = "pairwise.complete.obs")
+
+cor_long <- as.data.frame(cor_mat) %>%
+  rownames_to_column("marker1") %>%
+  pivot_longer(-marker1, names_to = "marker2", values_to = "r")
+
+rm(cor_mat)
+invisible(gc())
+
+```
+
+```{r correlation-heatmap, fig.height=7}
+
+cor_long %>%
+  ggplot(aes(x = marker1, y = marker2, fill = r)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = if_else(abs(r) > 0.4 & marker1 != marker2, "\u26a0", "")),
+    size = 3
+  ) +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "white", high = "#d62728",
+    midpoint = 0, limits = c(-1, 1), name = "Spearman r"
+  ) +
+  labs(
+    title    = "Cross-marker posterior probability correlation (cell-level Spearman)",
+    subtitle = "\u26a0 = |r| > 0.40 between markers; inspect for technical artifacts",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    panel.grid   = element_blank(),
+    plot.title   = element_text(face = "bold")
+  )
+
+```
+
+```{r correlation-table}
+
+flagged_cor <- cor_long %>%
+  filter(marker1 < marker2, abs(r) > 0.4) %>%
+  arrange(desc(abs(r))) %>%
+  rename(`Marker 1` = marker1, `Marker 2` = marker2, `Spearman r` = r) %>%
+  mutate(`Spearman r` = round(`Spearman r`, 3))
+
+if (nrow(flagged_cor) == 0) {
+  knitr::asis_output("No marker pairs with |r| > 0.40 detected.\n")
+} else {
+  flagged_cor %>%
+    kbl(caption = "Marker pairs with |r| > 0.40 — inspect for technical artifacts") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE) %>%
+    column_spec(3,
+                bold  = TRUE,
+                color = if_else(abs(flagged_cor$`Spearman r`) > 0.6,
+                                "#d62728", "#ff7f0e"))
+}
+
+```
+
+---
+
+# 7. Intensity vs. Posterior Probability
+
+Each panel plots the normalized intensity percentile rank (x-axis) against the posterior probability (y-axis) for a random sample of 5,000 cells per marker, colored by local point density. This reveals the shape of the model's probability-intensity mapping.
+
+**What good looks like:** A sharp sigmoidal transition — low probabilities at low intensities, a rapid transition zone, and high probabilities at high intensities. The transition should be narrow and occur away from the region of maximum cell density.
+
+**Red flags:** A broad gradual transition spanning a wide intensity range means small threshold changes will reclassify many cells and abundance estimates will be unstable. A transition sitting at the peak of cell density (a dense horizontal band of uncertain probabilities around p = 0.5) is particularly problematic.
+
+```{r intensity-posterior, fig.height=8}
+
+set.seed(42)
+
+intensity_data <- map_dfr(markers_clean, function(m) {
+  df_base %>%
+    select(SampleID, all_of(m)) %>%
+    rename(posterior = all_of(m)) %>%
+    filter(is.finite(posterior)) %>%
+    slice_sample(n = 5000) %>%
+    mutate(
+      marker         = m,
+      intensity_rank = percent_rank(posterior)
+    ) %>%
+    select(marker, intensity_rank, posterior)
+})
+
+intensity_data %>%
+  ggplot(aes(x = intensity_rank, y = posterior)) +
+  stat_density_2d(
+    aes(fill = after_stat(ndensity)),
+    geom    = "raster",
+    contour = FALSE,
+    n       = 100
+  ) +
+  scale_fill_viridis_c(option = "inferno", name = "Density", guide = "none") +
+  geom_hline(yintercept = 0.5, linetype = "dashed",
+             color = "white", linewidth = 0.4) +
+  facet_wrap(~ marker, ncol = 4) +
+  labs(
+    title    = "Posterior probability vs. intensity rank by marker",
+    subtitle = "5,000 randomly sampled cells per marker.",
+    x        = "Intensity percentile rank",
+    y        = "P(positive | data)"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.text    = element_text(face = "bold", size = 9),
+    panel.spacing = unit(8, "pt"),
+    plot.title    = element_text(face = "bold")
+  )
+
+rm(intensity_data)
+invisible(gc())
+
+```
+
+---
+
+# Session Information
+
+```{r session}
+sessionInfo()
+```
