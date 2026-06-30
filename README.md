@@ -9,9 +9,9 @@ _detection_output.groovy_ — Exports all QuPath detection objects (cell morphol
 
 **R — Orchestration**
 
-_run_pipeline.R_ — Top-level entry point that sequentially runs the {targets} DAG, launches a first-pass GammaGateR bootstrap subprocess, and renders the segmentation QC report.
+_run_pipeline.R_ — Top-level entry point that sequentially runs the {targets} data processing step and renders the segmentation QC report.
 
-_targets_pipeline.R_ — Defines the {targets} DAG that ingests QuPath_data.csv, joins sample metadata from Excel, applies per-sample non-zero-mean log10 normalization, and writes results/data_processed.csv.
+_targets_pipeline.R_ — Defines the {targets} process that ingests QuPath_data.csv, joins sample metadata from Excel, applies per-sample non-zero-mean log10 normalization, and writes results/data_processed.csv.
 
 **R — Analysis Reports**
 
